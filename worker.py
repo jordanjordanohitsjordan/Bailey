@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames, decide meal vs non-meal via OpenAI Vision+Reasoning,
+# extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning,
 # and record frames for later transcription & recipe generation.
 
 import os
@@ -10,7 +10,6 @@ import tempfile
 import subprocess
 import logging
 from pathlib import Path
-import uuid
 
 import boto3
 import requests
@@ -23,10 +22,10 @@ from sqlalchemy import Table, Column, String, Integer, MetaData, Text
 # Load environment variables
 load_dotenv()
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
-DATABASE_URL = os.getenv("DATABASE_URL")
+S3_BUCKET      = os.getenv("S3_BUCKET_NAME")
+DATABASE_URL   = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,41 +33,39 @@ logger = logging.getLogger("worker")
 
 # AWS clients
 sqs = boto3.client("sqs", region_name=AWS_REGION)
-s3 = boto3.client("s3", region_name=AWS_REGION)
+s3  = boto3.client("s3", region_name=AWS_REGION)
 
 # OpenAI client
 openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine        = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-metadata = MetaData()
+metadata      = MetaData()
 
 # Define tables
 jobs_table = Table(
-    "video_jobs",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("video_id", String(255), unique=True),
-    Column("video_url", Text),
+    "video_jobs", metadata,
+    Column("id",         Integer, primary_key=True),
+    Column("video_id",   String(255), unique=True),
+    Column("video_url",  Text),
     Column("raw_s3_key", String(255)),
-    Column("sender_id", String(255)),
-    Column("status", String(50)),
+    Column("sender_id",  String(255)),
+    Column("status",     String(50)),
 )
 frames_table = Table(
-    "video_frames",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("video_id", String(255)),
+    "video_frames", metadata,
+    Column("id",           Integer, primary_key=True),
+    Column("video_id",     String(255)),
     Column("frame_s3_key", String(255)),
     Column("frame_number", Integer),
 )
 
-# Tightened system prompt for meal detection
+# System prompt for meal detection
 MEAL_DETECTION_PROMPT = '''
-You are a vision-and-language chef assistant. 
-Given a sequence of images from a cooking reel, decide if it shows the preparation of a true 
-“meal” (multi-ingredient recipe) vs only snacking, reheating, or single-ingredient treatment.
+You are a vision-and-language chef assistant.
+Given images from a cooking reel, decide if it shows a true multi-ingredient “meal”
+vs only snacking, reheating, or single-ingredient treatment.
 Respond only with JSON: {"is_meal": boolean}
 '''
 
@@ -85,16 +82,28 @@ def download_video(url: str, dest: Path):
             f.write(chunk)
 
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
+    """Uploads with public-read ACL and returns the public URL."""
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
-    s3.upload_file(str(local_path), S3_BUCKET, s3_key)
+    s3.upload_file(
+        Filename=str(local_path),
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        ExtraArgs={"ACL": "public-read"}
+    )
     return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
-    logger.info(f"Extracting frames from {video_path.name}")
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run([
-        "ffmpeg", "-i", str(video_path), "-vf", "fps=1", str(frames_dir / "%04d.jpg")
-    ], check=True)
+    """Runs ffmpeg once to extract 1fps frames into frames_dir."""
+    if any(frames_dir.glob("*.jpg")):
+        logger.info("Frames already extracted; skipping")
+    else:
+        logger.info(f"Extracting frames from {video_path.name}")
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "ffmpeg", "-i", str(video_path),
+            "-vf", "fps=1",
+            str(frames_dir / "%04d.jpg")
+        ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
 def detect_meal(frames_urls: list[str]) -> bool:
@@ -104,8 +113,8 @@ def detect_meal(frames_urls: list[str]) -> bool:
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": "frame"},
-                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+                {"type": "text",    "text": "frame"},
+                {"type": "image_url","image_url": {"url": url, "detail": "low"}}
             ]
         })
     resp = openai.chat.completions.create(
@@ -117,64 +126,78 @@ def detect_meal(frames_urls: list[str]) -> bool:
         result = json.loads(resp.choices[0].message.content)
         return bool(result.get("is_meal"))
     except Exception:
-        logger.error("Failed to parse OpenAI response: %s", resp.choices[0].message.content)
+        logger.error("Failed to parse OpenAI response: %s",
+                     resp.choices[0].message.content)
         return False
 
 async def process_job(job_body: dict, receipt_handle: str):
-    video_url = job_body["video_url"]
-    sender_id = job_body["sender_id"]
+    video_url  = job_body["video_url"]
+    sender_id  = job_body["sender_id"]
     message_id = job_body["message_id"]
-    video_id = message_id.replace(":", "_")
+    video_id   = message_id.replace(":", "_")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        video_file = tmp / f"{video_id}.mp4"
+    # ensure we always delete the SQS message, even on error
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp        = Path(tmpdir)
+            video_file = tmp / f"{video_id}.mp4"
 
-        # 1. Download video
-        download_video(video_url, video_file)
+            # 1. Download video
+            download_video(video_url, video_file)
 
-        # 2. Upload raw video
-        raw_key = f"raw/{video_id}.mp4"
-        upload_to_s3(video_file, raw_key)
+            # 2. Upload raw video
+            raw_key = f"raw/{video_id}.mp4"
+            upload_to_s3(video_file, raw_key)
 
-        # 3. Extract frames
-        frames = extract_frames(video_file, tmp / "frames")
+            # 3. Extract frames (once)
+            frames = extract_frames(video_file, tmp / "frames")
 
-        # 4. Upload frames & collect URLs
-        frame_urls = []
-        for i, frame in enumerate(frames, start=1):
-            key = f"frames/{video_id}/{frame.name}"
-            frame_urls.append(upload_to_s3(frame, key))
+            # 4. Upload frames & collect URLs
+            frame_urls = []
+            for frame in frames:
+                key = f"frames/{video_id}/{frame.name}"
+                frame_urls.append(upload_to_s3(frame, key))
 
-        # 5. Detect meal
-        if not detect_meal(frame_urls):
-            logger.info("NON-MEAL detected; sending fallback DM.")
-            # TODO: send fallback DM via Instagram API
-            # Delete SQS message so we don't retry
-            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
-            return
+            # 5. Detect meal
+            if not detect_meal(frame_urls):
+                logger.info("NON-MEAL detected; sending fallback DM.")
+                # TODO: send fallback DM via Instagram API
+                return
 
-        # 6. Record to database
-        async with async_session() as session:
-            await session.execute(
-                jobs_table.insert().values(
-                    video_id=video_id,
-                    video_url=video_url,
-                    raw_s3_key=raw_key,
-                    sender_id=sender_id,
-                    status="meal_detected"
-                )
-            )
-            for idx, url in enumerate(frame_urls, start=1):
+            # 6. Record to database
+            async with async_session() as session:
                 await session.execute(
-                    frames_table.insert().values(
+                    jobs_table.insert().values(
                         video_id=video_id,
-                        frame_s3_key=url,
-                        frame_number=idx
+                        video_url=video_url,
+                        raw_s3_key=raw_key,
+                        sender_id=sender_id,
+                        status="meal_detected"
                     )
                 )
-            await session.commit()
-        logger.info("Meal frames recorded; ready for transcription & recipe.")
+                for idx, url in enumerate(frame_urls, start=1):
+                    await session.execute(
+                        frames_table.insert().values(
+                            video_id=video_id,
+                            frame_s3_key=url,
+                            frame_number=idx
+                        )
+                    )
+                await session.commit()
+            logger.info("Meal frames recorded; ready for transcription & recipe.")
+
+    except Exception:
+        logger.exception("Error processing job %s", video_id)
+
+    finally:
+        # always delete so we don’t reprocess/loop
+        try:
+            sqs.delete_message(
+                QueueUrl=SQS_QUEUE_URL,
+                ReceiptHandle=receipt_handle
+            )
+        except Exception:
+            logger.warning("Failed to delete SQS message: %s", receipt_handle)
 
 if __name__ == "__main__":
     import asyncio
@@ -188,20 +211,10 @@ if __name__ == "__main__":
                 WaitTimeSeconds=20
             )
             for msg in resp.get("Messages", []):
-                receipt = msg["ReceiptHandle"]
-                try:
-                    job = json.loads(msg["Body"])
-                    await process_job(job, receipt)
-                except Exception:
-                    logger.exception("Failed to process job: %s", msg)
-                else:
-                    # delete only on success for meal-detected path
-                    # non-meal path already deletes
-                    if msg:
-                        try:
-                            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt)
-                        except Exception:
-                            logger.warning("Failed to delete SQS message: %s", receipt)
+                await process_job(
+                    job_body=json.loads(msg["Body"]),
+                    receipt_handle=msg["ReceiptHandle"]
+                )
             await asyncio.sleep(1)
 
     asyncio.run(main_loop())
