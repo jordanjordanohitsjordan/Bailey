@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames, decide meal vs non-meal via OpenAI Vision+Structured Outputs,
+# extract frames, decide meal vs non-meal via OpenAI Vision+Reasoning,
 # and record frames for later transcription & recipe generation.
 
 import os
@@ -10,6 +10,7 @@ import tempfile
 import subprocess
 import logging
 from pathlib import Path
+import uuid
 
 import boto3
 import requests
@@ -63,21 +64,13 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# System prompt for meal detection
-MEAL_DETECTION_PROMPT = """
-You are a vision-and-language chef assistant.
-Given a series of frames from a cooking reel, decide if it shows the preparation of a true “meal” (multi-ingredient recipe)
-versus only snacking, reheating, or single-ingredient treatment.
-Rules:
-1. Combining ≥2 distinct ingredients → MEAL.
-2. Assembling ≥3 separate components (even without cooking) → MEAL.
-3. Only heating or plating a single packaged item → NON-MEAL.
-4. Single-ingredient roasting/baking with minimal seasoning → NON-MEAL.
-5. Brand-name snack eaten or melted alone → NON-MEAL.
-6. Multi-step drink with ≥2 additions counts as MEAL.
-Respond with JSON matching this schema:
-{"is_meal": boolean}
-"""
+# Tightened system prompt for meal detection
+MEAL_DETECTION_PROMPT = '''
+You are a vision-and-language chef assistant. 
+Given a sequence of images from a cooking reel, decide if it shows the preparation of a true 
+“meal” (multi-ingredient recipe) vs only snacking, reheating, or single-ingredient treatment.
+Respond only with JSON: {"is_meal": boolean}
+'''
 
 async def init_db():
     async with engine.begin() as conn:
@@ -94,8 +87,7 @@ def download_video(url: str, dest: Path):
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
     s3.upload_file(str(local_path), S3_BUCKET, s3_key)
-    # Always use the global endpoint so that OpenAI can fetch it
-    return f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
+    return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
     logger.info(f"Extracting frames from {video_path.name}")
@@ -105,52 +97,40 @@ def extract_frames(video_path: Path, frames_dir: Path):
     ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
-def detect_meal(frame_urls: list[str]) -> bool:
-    logger.info("Detecting meal versus non-meal over %d frames", len(frame_urls))
+def detect_meal(frames_urls: list[str]) -> bool:
+    logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames")
     messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
-    for url in frame_urls:
+    for url in frames_urls:
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": "Frame"},
+                {"type": "text", "text": "frame"},
                 {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
             ]
         })
-
     resp = openai.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         messages=messages,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "meal_detection",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "is_meal": {"type": "boolean"}
-                    },
-                    "required": ["is_meal"],
-                    "additionalProperties": False
-                }
-            }
-        }
+        max_tokens=8
     )
+    try:
+        result = json.loads(resp.choices[0].message.content)
+        return bool(result.get("is_meal"))
+    except Exception:
+        logger.error("Failed to parse OpenAI response: %s", resp.choices[0].message.content)
+        return False
 
-    result = resp.choices[0].message.parsed
-    return bool(result.is_meal)
-
-async def process_job(job_body: dict):
+async def process_job(job_body: dict, receipt_handle: str):
     video_url = job_body["video_url"]
     sender_id = job_body["sender_id"]
     message_id = job_body["message_id"]
     video_id = message_id.replace(":", "_")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
         video_file = tmp / f"{video_id}.mp4"
 
-        # 1. Download
+        # 1. Download video
         download_video(video_url, video_file)
 
         # 2. Upload raw video
@@ -158,23 +138,23 @@ async def process_job(job_body: dict):
         upload_to_s3(video_file, raw_key)
 
         # 3. Extract frames
-        frames_dir = tmp / "frames"
-        frames = extract_frames(video_file, frames_dir)
+        frames = extract_frames(video_file, tmp / "frames")
 
-        # 4. Upload frames & gather URLs
+        # 4. Upload frames & collect URLs
         frame_urls = []
-        for frame in frames:
+        for i, frame in enumerate(frames, start=1):
             key = f"frames/{video_id}/{frame.name}"
-            url = upload_to_s3(frame, key)
-            frame_urls.append(url)
+            frame_urls.append(upload_to_s3(frame, key))
 
-        # 5. Meal detection
+        # 5. Detect meal
         if not detect_meal(frame_urls):
             logger.info("NON-MEAL detected; sending fallback DM.")
             # TODO: send fallback DM via Instagram API
+            # Delete SQS message so we don't retry
+            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
             return
 
-        # 6. Record detected meal frames
+        # 6. Record to database
         async with async_session() as session:
             await session.execute(
                 jobs_table.insert().values(
@@ -194,7 +174,6 @@ async def process_job(job_body: dict):
                     )
                 )
             await session.commit()
-
         logger.info("Meal frames recorded; ready for transcription & recipe.")
 
 if __name__ == "__main__":
@@ -209,15 +188,20 @@ if __name__ == "__main__":
                 WaitTimeSeconds=20
             )
             for msg in resp.get("Messages", []):
+                receipt = msg["ReceiptHandle"]
                 try:
                     job = json.loads(msg["Body"])
-                    await process_job(job)
-                    sqs.delete_message(
-                        QueueUrl=SQS_QUEUE_URL,
-                        ReceiptHandle=msg["ReceiptHandle"]
-                    )
+                    await process_job(job, receipt)
                 except Exception:
                     logger.exception("Failed to process job: %s", msg)
+                else:
+                    # delete only on success for meal-detected path
+                    # non-meal path already deletes
+                    if msg:
+                        try:
+                            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt)
+                        except Exception:
+                            logger.warning("Failed to delete SQS message: %s", receipt)
             await asyncio.sleep(1)
 
     asyncio.run(main_loop())
