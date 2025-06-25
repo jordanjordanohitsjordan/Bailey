@@ -141,10 +141,9 @@ def detect_meal(frames_urls: list[str]) -> bool:
 
     # Call with structured outputs JSON Schema
     resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=messages,
         response_format=MEAL_SCHEMA,
-        max_tokens=8
     )
 
     choice = resp.choices[0].message
