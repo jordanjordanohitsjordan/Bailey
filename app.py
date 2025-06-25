@@ -18,7 +18,7 @@ SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize AWS SQS client
+# Initialize AWS SQS client (region picked up from AWS_REGION)
 sqs = boto3.client("sqs")
 
 # Initialize FastAPI app
@@ -93,9 +93,9 @@ async def receive_webhook(request: Request):
                 continue
 
             attachments = resp.json().get("attachments", [])
-            # Enqueue jobs for video attachments
+            # Enqueue jobs for video or reel attachments
             for att in attachments:
-                if att.get("type") == "video":
+                if att.get("type") in ("video", "ig_reel"):
                     video_url = att.get("payload", {}).get("url")
                     job = {"video_url": video_url, "sender_id": sender, "message_id": mid}
                     try:
