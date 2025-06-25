@@ -1,6 +1,8 @@
 import os
 from fastapi import FastAPI, HTTPException, Request, Query
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import List, Optional
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +22,22 @@ async def verify_webhook(
         return int(hub_challenge)
     raise HTTPException(status_code=403, detail="Verification token mismatch")
 
+# Data models for parsing messaging events
+class MessagingEntry(BaseModel):
+    sender: dict
+    recipient: dict
+    timestamp: int
+    message: Optional[dict]
+
+class WebhookEntry(BaseModel):
+    id: str
+    time: int
+    messaging: List[MessagingEntry]
+
+class WebhookPayload(BaseModel):
+    object: str
+    entry: List[WebhookEntry]
+
 # Incoming events handler (POST)
 @app.post("/webhook")
 async def receive_webhook(request: Request):
@@ -27,15 +45,16 @@ async def receive_webhook(request: Request):
     data = await request.json()
     print("Webhook payload:", data)
 
-    # Only process page events
-    if data.get("object") != "page":
+    # Only process supported objects
+    if data.get("object") not in ("page", "instagram"):
         return {"status": "ignored"}
 
+    # Loop through entries
     for entry in data.get("entry", []):
-        # First, look for direct messaging events
+        # Direct messaging events if present
         messaging_events = entry.get("messaging", [])
-
-        # Fallback: some payloads use changes[].value.messaging
+        
+        # Fallback for Instagram-style payloads under changes
         if not messaging_events:
             for change in entry.get("changes", []):
                 messaging_events.extend(
