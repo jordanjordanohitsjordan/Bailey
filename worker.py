@@ -1,17 +1,20 @@
+#!/usr/bin/env python3
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames, upload frames, and record metadata to MySQL.
+# extract frames, decide meal vs non-meal via OpenAI Vision+Reasoning,
+# and record frames for later transcription & recipe generation.
 
 import os
 import json
-import time
 import tempfile
 import subprocess
 import logging
 from pathlib import Path
+import uuid
 
 import boto3
 import requests
+import openai
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -22,21 +25,26 @@ load_dotenv()
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
 
 # AWS clients
-sqs = boto3.client("sqs")
-s3 = boto3.client("s3")
+sqs = boto3.client("sqs", region_name=AWS_REGION)
+s3 = boto3.client("s3", region_name=AWS_REGION)
+
+# OpenAI client
+openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 metadata = MetaData()
 
-# Define tables (reflect or define your schema here)
+# Define tables
 jobs_table = Table(
     "video_jobs",
     metadata,
@@ -56,82 +64,128 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# Ensure tables exist (run once)
+# Tightened system prompt following our meal-vs-snack logic:
+MEAL_DETECTION_PROMPT = """
+You are a vision-and-language chef assistant. 
+Given a sequence of images from a cooking reel, decide if it shows the preparation of a true “meal” (multi-ingredient recipe) vs only snacking, reheating, or single-ingredient treatment.
+Rules:
+1. Combining ≥2 distinct ingredients in any way → MEAL.
+2. Assembly of ≥3 separate components (even without cooking) → MEAL.
+3. Only heating or plating a single packaged item → NON-MEAL.
+4. Single-ingredient roasting/baking with minimal seasoning → NON-MEAL.
+5. Brand-name snack eaten or melted alone → NON-MEAL.
+6. Multi-step drink with ≥2 additions counts as MEAL.
+Respond **only** with valid JSON:
+{"is_meal": true_or_false}
+"""
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
 
-
-def download_video(url: str, dest_path: Path):
+def download_video(url: str, dest: Path):
     logger.info(f"Downloading video from {url}")
     resp = requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
-    with open(dest_path, "wb") as f:
+    with open(dest, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
-
-def upload_to_s3(local_path: Path, s3_key: str):
-    logger.info(f"Uploading {local_path} to s3://{S3_BUCKET}/{s3_key}")
+def upload_to_s3(local_path: Path, s3_key: str) -> str:
+    logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
     s3.upload_file(str(local_path), S3_BUCKET, s3_key)
-    return f"s3://{S3_BUCKET}/{s3_key}"
-
+    return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
-    logger.info(f"Extracting frames from {video_path} to {frames_dir}")
+    logger.info(f"Extracting frames from {video_path.name}")
     frames_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run([
         "ffmpeg", "-i", str(video_path), "-vf", "fps=1", str(frames_dir / "%04d.jpg")
     ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
+def detect_meal(frames_urls: list[str]) -> bool:
+    logger.info("Calling OpenAI to detect meal vs non-meal over %d frames", len(frames_urls))
+    # Build chat messages
+    messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
+    for url in frames_urls:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "frame"},
+                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+            ]
+        })
+    resp = openai.ChatCompletion.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        max_tokens=8
+    )
+    content = resp.choices[0].message.content.strip()
+    try:
+        result = json.loads(content)
+        return bool(result.get("is_meal"))
+    except Exception:
+        logger.error("Failed to parse OpenAI response: %s", content)
+        return False
 
 async def process_job(job_body: dict):
     video_url = job_body["video_url"]
     sender_id = job_body["sender_id"]
     message_id = job_body["message_id"]
-    video_id = message_id.replace(':', '_')
+    video_id = message_id.replace(":", "_")
 
-    # Temporary workspace
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        video_file = tmpdir / f"{video_id}.mp4"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        video_file = tmp / f"{video_id}.mp4"
 
         # 1. Download video
         download_video(video_url, video_file)
 
-        # 2. Upload raw video to S3
+        # 2. Upload raw video
         raw_key = f"raw/{video_id}.mp4"
-        raw_s3_url = upload_to_s3(video_file, raw_key)
+        upload_to_s3(video_file, raw_key)
 
         # 3. Extract frames
-        frames_dir = tmpdir / "frames"
+        frames_dir = tmp / "frames"
         frames = extract_frames(video_file, frames_dir)
 
+        # 4. Upload frames & collect URLs
+        frame_urls = []
+        for idx, frame in enumerate(frames, start=1):
+            key = f"frames/{video_id}/{frame.name}"
+            url = upload_to_s3(frame, key)
+            frame_urls.append(url)
+
+        # 5. Detect meal
+        is_meal = detect_meal(frame_urls)
+        if not is_meal:
+            logger.info("No meal detected; sending fallback to user.")
+            # TODO: send fallback DM via Instagram API
+            return
+
+        # 6. Record job + frames in database
         async with async_session() as session:
-            # Insert job record
             await session.execute(
                 jobs_table.insert().values(
                     video_id=video_id,
                     video_url=video_url,
                     raw_s3_key=raw_key,
                     sender_id=sender_id,
-                    status="frames_extracted"
+                    status="meal_detected"
                 )
             )
-            # Insert frame records
-            for idx, frame_path in enumerate(frames, start=1):
-                frame_key = f"frames/{video_id}/{frame_path.name}"
-                upload_to_s3(frame_path, frame_key)
+            for idx, url in enumerate(frame_urls, start=1):
                 await session.execute(
                     frames_table.insert().values(
                         video_id=video_id,
-                        frame_s3_key=frame_key,
+                        frame_s3_key=url,
                         frame_number=idx
                     )
                 )
             await session.commit()
 
+        logger.info("Meal frames recorded; ready for transcription & recipe.")
 
 if __name__ == "__main__":
     import asyncio
@@ -139,25 +193,22 @@ if __name__ == "__main__":
     async def main_loop():
         await init_db()
         while True:
-            # Poll SQS for messages
             resp = sqs.receive_message(
                 QueueUrl=SQS_QUEUE_URL,
                 MaxNumberOfMessages=5,
                 WaitTimeSeconds=20
             )
-            messages = resp.get("Messages", [])
-            if not messages:
-                continue
-            for msg in messages:
+            for msg in resp.get("Messages", []):
                 try:
                     job = json.loads(msg["Body"])
                     await process_job(job)
-                    # Delete message on success
                     sqs.delete_message(
                         QueueUrl=SQS_QUEUE_URL,
                         ReceiptHandle=msg["ReceiptHandle"]
                     )
                 except Exception:
-                    logger.exception("Failed to process job: %s", msg)
+                    logger.exception("Failed job: %s", msg)
+            # small pause to avoid tight-loop on errors
+            await asyncio.sleep(1)
 
     asyncio.run(main_loop())
