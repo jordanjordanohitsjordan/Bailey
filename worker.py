@@ -94,7 +94,8 @@ def download_video(url: str, dest: Path):
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
     s3.upload_file(str(local_path), S3_BUCKET, s3_key)
-    return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+    # Always use the global endpoint so that OpenAI can fetch it
+    return f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
     logger.info(f"Extracting frames from {video_path.name}")
@@ -207,8 +208,7 @@ if __name__ == "__main__":
                 MaxNumberOfMessages=5,
                 WaitTimeSeconds=20
             )
-            messages = resp.get("Messages", [])
-            for msg in messages:
+            for msg in resp.get("Messages", []):
                 try:
                     job = json.loads(msg["Body"])
                     await process_job(job)
