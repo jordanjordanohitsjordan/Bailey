@@ -10,10 +10,10 @@ import tempfile
 import subprocess
 import logging
 from pathlib import Path
-import uuid
 
 import boto3
 import requests
+from openai import OpenAI
 import openai
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -37,7 +37,7 @@ sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # OpenAI client
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Database setup (async SQLAlchemy)
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -106,7 +106,6 @@ def extract_frames(video_path: Path, frames_dir: Path):
 
 def detect_meal(frames_urls: list[str]) -> bool:
     logger.info("Calling OpenAI to detect meal vs non-meal over %d frames", len(frames_urls))
-    # Build chat messages
     messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
     for url in frames_urls:
         messages.append({
@@ -116,17 +115,16 @@ def detect_meal(frames_urls: list[str]) -> bool:
                 {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
             ]
         })
-    resp = openai.ChatCompletion.create(
+
+    response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
-        max_tokens=8
     )
-    content = resp.choices[0].message.content.strip()
+    reply = response.choices[0].message.content.strip()
     try:
-        result = json.loads(content)
-        return bool(result.get("is_meal"))
+        return json.loads(reply)["is_meal"]
     except Exception:
-        logger.error("Failed to parse OpenAI response: %s", content)
+        logger.error("Failed to parse OpenAI response: %s", reply)
         return False
 
 async def process_job(job_body: dict):
@@ -158,8 +156,7 @@ async def process_job(job_body: dict):
             frame_urls.append(url)
 
         # 5. Detect meal
-        is_meal = detect_meal(frame_urls)
-        if not is_meal:
+        if not detect_meal(frame_urls):
             logger.info("No meal detected; sending fallback to user.")
             # TODO: send fallback DM via Instagram API
             return
@@ -208,7 +205,6 @@ if __name__ == "__main__":
                     )
                 except Exception:
                     logger.exception("Failed job: %s", msg)
-            # small pause to avoid tight-loop on errors
             await asyncio.sleep(1)
 
     asyncio.run(main_loop())
