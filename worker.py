@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames, decide meal vs non-meal via OpenAI Vision+Reasoning,
+# extract frames, decide meal vs non-meal via OpenAI Vision+Structured Outputs,
 # and record frames for later transcription & recipe generation.
 
 import os
@@ -13,7 +13,6 @@ from pathlib import Path
 
 import boto3
 import requests
-from openai import OpenAI
 import openai
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -37,7 +36,7 @@ sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3 = boto3.client("s3", region_name=AWS_REGION)
 
 # OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -64,19 +63,20 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# Tightened system prompt following our meal-vs-snack logic:
+# System prompt for meal detection
 MEAL_DETECTION_PROMPT = """
-You are a vision-and-language chef assistant. 
-Given a sequence of images from a cooking reel, decide if it shows the preparation of a true “meal” (multi-ingredient recipe) vs only snacking, reheating, or single-ingredient treatment.
+You are a vision-and-language chef assistant.
+Given a series of frames from a cooking reel, decide if it shows the preparation of a true “meal” (multi-ingredient recipe)
+versus only snacking, reheating, or single-ingredient treatment.
 Rules:
-1. Combining ≥2 distinct ingredients in any way → MEAL.
-2. Assembly of ≥3 separate components (even without cooking) → MEAL.
+1. Combining ≥2 distinct ingredients → MEAL.
+2. Assembling ≥3 separate components (even without cooking) → MEAL.
 3. Only heating or plating a single packaged item → NON-MEAL.
 4. Single-ingredient roasting/baking with minimal seasoning → NON-MEAL.
 5. Brand-name snack eaten or melted alone → NON-MEAL.
 6. Multi-step drink with ≥2 additions counts as MEAL.
-Respond **only** with valid JSON:
-{"is_meal": true_or_false}
+Respond with JSON matching this schema:
+{"is_meal": boolean}
 """
 
 async def init_db():
@@ -104,28 +104,40 @@ def extract_frames(video_path: Path, frames_dir: Path):
     ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
-def detect_meal(frames_urls: list[str]) -> bool:
-    logger.info("Calling OpenAI to detect meal vs non-meal over %d frames", len(frames_urls))
+def detect_meal(frame_urls: list[str]) -> bool:
+    logger.info("Detecting meal versus non-meal over %d frames", len(frame_urls))
     messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
-    for url in frames_urls:
+    for url in frame_urls:
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": "frame"},
+                {"type": "text", "text": "Frame"},
                 {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
             ]
         })
 
-    response = client.chat.completions.create(
+    resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "meal_detection",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_meal": {"type": "boolean"}
+                    },
+                    "required": ["is_meal"],
+                    "additionalProperties": False
+                }
+            }
+        }
     )
-    reply = response.choices[0].message.content.strip()
-    try:
-        return json.loads(reply)["is_meal"]
-    except Exception:
-        logger.error("Failed to parse OpenAI response: %s", reply)
-        return False
+
+    result = resp.choices[0].message.parsed
+    return bool(result.is_meal)
 
 async def process_job(job_body: dict):
     video_url = job_body["video_url"]
@@ -133,11 +145,11 @@ async def process_job(job_body: dict):
     message_id = job_body["message_id"]
     video_id = message_id.replace(":", "_")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
         video_file = tmp / f"{video_id}.mp4"
 
-        # 1. Download video
+        # 1. Download
         download_video(video_url, video_file)
 
         # 2. Upload raw video
@@ -148,20 +160,20 @@ async def process_job(job_body: dict):
         frames_dir = tmp / "frames"
         frames = extract_frames(video_file, frames_dir)
 
-        # 4. Upload frames & collect URLs
+        # 4. Upload frames & gather URLs
         frame_urls = []
-        for idx, frame in enumerate(frames, start=1):
+        for frame in frames:
             key = f"frames/{video_id}/{frame.name}"
             url = upload_to_s3(frame, key)
             frame_urls.append(url)
 
-        # 5. Detect meal
+        # 5. Meal detection
         if not detect_meal(frame_urls):
-            logger.info("No meal detected; sending fallback to user.")
+            logger.info("NON-MEAL detected; sending fallback DM.")
             # TODO: send fallback DM via Instagram API
             return
 
-        # 6. Record job + frames in database
+        # 6. Record detected meal frames
         async with async_session() as session:
             await session.execute(
                 jobs_table.insert().values(
@@ -195,7 +207,8 @@ if __name__ == "__main__":
                 MaxNumberOfMessages=5,
                 WaitTimeSeconds=20
             )
-            for msg in resp.get("Messages", []):
+            messages = resp.get("Messages", [])
+            for msg in messages:
                 try:
                     job = json.loads(msg["Body"])
                     await process_job(job)
@@ -204,7 +217,7 @@ if __name__ == "__main__":
                         ReceiptHandle=msg["ReceiptHandle"]
                     )
                 except Exception:
-                    logger.exception("Failed job: %s", msg)
+                    logger.exception("Failed to process job: %s", msg)
             await asyncio.sleep(1)
 
     asyncio.run(main_loop())
