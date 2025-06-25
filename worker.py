@@ -77,7 +77,7 @@ Respond *only* with JSON matching this schema:
 }
 """
 
-# Pre-build the JSON Schema we'll send in response_format
+# Pre-built JSON Schema for Structured Outputs
 MEAL_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -128,7 +128,7 @@ def extract_frames(video_path: Path, frames_dir: Path):
 def detect_meal(frames_urls: list[str]) -> bool:
     logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames")
 
-    # Build messages payload
+    # Build messages
     messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
     for url in frames_urls:
         messages.append({
@@ -139,21 +139,20 @@ def detect_meal(frames_urls: list[str]) -> bool:
             ]
         })
 
-    # Call with structured outputs JSON Schema
+    # Call OpenAI with Structured Outputs
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
         response_format=MEAL_SCHEMA,
     )
-
     choice = resp.choices[0].message
 
-    # Handle explicit refusal
-    if hasattr(choice, "refusal"):
+    # Only treat as refusal if there's a non-empty refusal string
+    if getattr(choice, "refusal", None):
         logger.error("Model refused meal detection: %s", choice.refusal)
         return False
 
-    # content is now guaranteed valid JSON matching our schema
+    # Guaranteed to match our schema
     data = json.loads(choice.content)
     return data["is_meal"]
 
@@ -184,7 +183,7 @@ async def process_job(job_body: dict, receipt_handle: str):
                 key = f"frames/{video_id}/{frame.name}"
                 frame_urls.append(upload_to_s3(frame, key))
 
-            # 5. Detect meal using Structured Outputs
+            # 5. Detect meal
             if not detect_meal(frame_urls):
                 logger.info("NON-MEAL detected; sending fallback DM.")
                 # TODO: send fallback DM via Instagram API
