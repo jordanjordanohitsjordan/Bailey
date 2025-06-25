@@ -1,19 +1,34 @@
-import os
-from fastapi import FastAPI, HTTPException, Query
-from dotenv import load_dotenv
+from fastapi import Request
+from pydantic import BaseModel
+from typing import List, Optional
 
-load_dotenv()  # loads IG_WEBHOOK_VERIFY_TOKEN
+class MessagingEntry(BaseModel):
+    sender: dict
+    recipient: dict
+    timestamp: int
+    message: Optional[dict]
+    # you can add other fields like delivery, read, postback, etc.
 
-VERIFY_TOKEN = os.getenv("IG_WEBHOOK_VERIFY_TOKEN", "my_verify_token")
+class WebhookEntry(BaseModel):
+    id: str
+    time: int
+    messaging: List[MessagingEntry]
 
-app = FastAPI()
+class WebhookPayload(BaseModel):
+    object: str
+    entry: List[WebhookEntry]
 
-@app.get("/webhook")
-async def verify_webhook(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge: str = Query(None, alias="hub.challenge"),
-):
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return int(hub_challenge)
-    raise HTTPException(status_code=403, detail="Verification token mismatch")
+@app.post("/webhook")
+async def receive_webhook(payload: WebhookPayload, request: Request):
+    # Acknowledge receipt immediately
+    # FastAPI will auto-return 200 OK if no exception is raised
+    if payload.object != "page":
+        return {"status": "ignored"}
+
+    for entry in payload.entry:
+        for change in entry.messaging:
+            if change.message and change.sender:
+                # Log the full event for inspection
+                print("Received IG DM event:", change.json())
+                # TODO: enqueue to SQS / process video jobs
+    return {"status": "processed"}
