@@ -82,13 +82,11 @@ def download_video(url: str, dest: Path):
             f.write(chunk)
 
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
-    """Uploads with public-read ACL and returns the public URL."""
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
     s3.upload_file(
         Filename=str(local_path),
         Bucket=S3_BUCKET,
-        Key=s3_key,
-        ExtraArgs={"ACL": "public-read"}
+        Key=s3_key
     )
     return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
