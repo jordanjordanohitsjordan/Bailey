@@ -125,12 +125,11 @@ def generate_ack_text(
     # 1) Role-setting system prompt
     system = (
     "You are a friendly, energetic chef’s assistant DM’ing a friend. "
-    "Write an acknowledgement in 20 words or less that follows these rules:"
-    "\n • Begin with a single-word or short-phrase reaction (e.g. “Oooft!”, “Wow!”)."
+    "Write an acknowledgement in 20-40 words that follows these rules:"
+    "\n • Begin with a single-word or short-phrase reaction."
     "\n • Immediately after, reference one concrete detail you saw or read—"
     " for a meal, name the dish and a detail about it);"
     " for a non-meal, reference the subject of the Reel."
-    "\n • Avoid any other filler—no extra adjectives or context."
     "\n • End with the exact closing based on type:"
     + (
         "\n   – Meal: “Your recipe is on the way!”"
