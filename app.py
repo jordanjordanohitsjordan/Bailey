@@ -10,9 +10,9 @@ import boto3
 
 # Load environment variables
 load_dotenv()
-VERIFY_TOKEN = os.getenv("IG_WEBHOOK_VERIFY_TOKEN", "my_verify_token")
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
-SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
+VERIFY_TOKEN        = os.getenv("IG_WEBHOOK_VERIFY_TOKEN", "my_verify_token")
+PAGE_ACCESS_TOKEN   = os.getenv("PAGE_ACCESS_TOKEN")
+SQS_QUEUE_URL       = os.getenv("SQS_QUEUE_URL")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -71,8 +71,8 @@ async def receive_webhook(request: Request):
 
         for event in messaging_events:
             sender_id = event.get("sender", {}).get("id")
-            message = event.get("message", {}) or {}
-            mid = message.get("mid")
+            message   = event.get("message", {}) or {}
+            mid       = message.get("mid")
             if not sender_id or not mid:
                 continue
 
@@ -96,15 +96,32 @@ async def receive_webhook(request: Request):
                     logger.error("Error fetching attachments for %s: %s", mid, e)
                     attachments = []
 
-            # 3) Enqueue jobs for video or reel attachments
+            # 3) Enqueue jobs for video or reel attachments, capturing caption
             for att in attachments:
                 att_type = att.get("type")
                 if att_type in ("video", "ig_reel"):
-                    video_url = att.get("payload", {}).get("url")
+                    payload    = att.get("payload", {}) or {}
+                    video_url  = payload.get("url")
+                    # user-typed text fallback
+                    user_text  = message.get("text", "")
+                    # for reels, the post's caption lives in payload.title
+                    reel_title = payload.get("title", "")
+                    # prefer the Reel's caption, otherwise user text
+                    caption    = reel_title or user_text
+
                     if video_url:
-                        job = {"video_url": video_url, "sender_id": sender_id, "message_id": mid}
+                        job = {
+                            "video_url":  video_url,
+                            "sender_id":  sender_id,
+                            "message_id": mid,
+                            "caption":    caption,
+                        }
+                        logger.info("Enqueuing job with caption: %r", caption)
                         try:
-                            sqs.send_message(QueueUrl=SQS_QUEUE_URL, MessageBody=json.dumps(job))
+                            sqs.send_message(
+                                QueueUrl=SQS_QUEUE_URL,
+                                MessageBody=json.dumps(job)
+                            )
                             logger.info("Enqueued job: %s", job)
                         except Exception as e:
                             logger.error("Failed to enqueue job %s: %s", job, e)
