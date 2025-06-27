@@ -124,7 +124,7 @@ def generate_ack_text(
     """
     # 1) Role-setting system prompt
     system = (
-    "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial UK text-speak way, but don't use cringe language, be casually cool. "
+    "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial UK text-speak way, but don't use cringe language, be casually cool, and don't use em dashes. "
     "Write an acknowledgement in a maximum of 20 words that follows these rules:"
     "\n • Reference one concrete detail you saw or read—"
     " for a meal, name the dish and one detail about it, use a single relevant ios emoji;"
