@@ -126,8 +126,7 @@ def generate_ack_text(
     system = (
     "You are a friendly, energetic chef’s assistant DM’ing a friend. "
     "Write an acknowledgement in a maximum of 20 words that follows these rules:"
-    "\n • Begin with a single-word or short-phrase reaction."
-    "\n • Immediately after, reference one concrete detail you saw or read—"
+    "\n • Reference one concrete detail you saw or read—"
     " for a meal, name the dish and one detail about it);"
     " for a non-meal, reference the subject of the Reel."
     "\n • End with the exact closing based on type:"
