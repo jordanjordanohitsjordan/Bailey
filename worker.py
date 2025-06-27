@@ -2,7 +2,8 @@
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
 # extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
-# (with Structured Outputs), send acknowledgement, and record frames for later transcription & recipe generation.
+# (with Structured Outputs), send a dynamic acknowledgement referencing both
+# the Reel’s caption and its frames, and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -80,7 +81,7 @@ Respond *only* with JSON matching this schema:
 }
 """
 
-# Pre-built JSON Schema for Structured Outputs
+# JSON Schema for Structured Outputs
 MEAL_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -97,17 +98,19 @@ MEAL_SCHEMA = {
     }
 }
 
-# Prompts for acknowledgement messages
+# Prompts for dynamic acknowledgement messages
 ACK_MEAL_PROMPT = """
-You are a friendly assistant. A user has just sent a short cooking video that was detected as a meal. 
-Write them a personalized acknowledgement referencing “the meal you sent” (feel free to mention it was delicious-looking or similar), and tell them: “Your recipe is on the way!”
-Keep it under 50 words.
+You are a fun, enthusiastic assistant. A user just sent a cooking reel that was detected as a meal.
+They captioned: "{caption}"
+You also saw the following frames.
+Write a playful, personalized acknowledgement referencing both what you read in the caption and what you saw in the images, and tell them their recipe is on the way. Keep it under 50 words.
 """
 
 ACK_NONMEAL_PROMPT = """
-You are a friendly assistant. A user has just sent a video that wasn’t a multi-ingredient meal. 
-Write them a polite acknowledgement referencing “the video you sent” (you could say you appreciate it), and tell them: “That’s not a recipe, but thanks for sharing!”
-Keep it under 50 words.
+You are a witty, friendly assistant. A user just sent a reel that wasn’t a meal.
+They captioned: "{caption}"
+You also saw the following frames.
+Write a humorous, polite acknowledgement referencing both what they wrote and what you saw, and note there’s no meal here. Keep it under 50 words.
 """
 
 def send_ig_message(recipient_id: str, text: str):
@@ -126,16 +129,30 @@ def send_ig_message(recipient_id: str, text: str):
     resp.raise_for_status()
     return resp.json()
 
-def generate_ack_text(is_meal: bool) -> str:
-    """Generates a dynamic acknowledgement message via OpenAI."""
-    system_prompt = ACK_MEAL_PROMPT if is_meal else ACK_NONMEAL_PROMPT
+def generate_ack_text(
+    is_meal: bool,
+    caption: str,
+    frame_urls: list[str]
+) -> str:
+    """Generates a personalized acknowledgement referencing caption & image frames."""
+    # Format system prompt with the caption
+    raw_prompt = ACK_MEAL_PROMPT if is_meal else ACK_NONMEAL_PROMPT
+    system_prompt = raw_prompt.format(caption=caption or "(no caption)")
+
+    # Build messages: system prompt + up to 3 frames
+    messages = [{"role": "system", "content": system_prompt}]
+    for url in frame_urls[:3]:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+            ]
+        })
+
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": "Generate the acknowledgement now."}
-        ],
-        temperature=0.7
+        messages=messages,
+        temperature=0.8
     )
     return resp.choices[0].message.content.strip()
 
@@ -184,7 +201,7 @@ def detect_meal(frames_urls: list[str]) -> bool:
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
-        response_format=MEAL_SCHEMA,
+        response_format=MEAL_SCHEMA
     )
     choice = resp.choices[0].message
     if getattr(choice, "refusal", None):
@@ -197,6 +214,7 @@ async def process_job(job_body: dict, receipt_handle: str):
     video_url  = job_body["video_url"]
     sender_id  = job_body["sender_id"]
     message_id = job_body["message_id"]
+    caption    = job_body.get("caption", "")
     video_id   = message_id.replace(":", "_")
 
     try:
@@ -223,9 +241,9 @@ async def process_job(job_body: dict, receipt_handle: str):
             # 5. Detect meal
             is_meal = detect_meal(frame_urls)
 
-            # 6. Send acknowledgement
+            # 6. Send dynamic acknowledgement
             try:
-                ack_text = generate_ack_text(is_meal)
+                ack_text = generate_ack_text(is_meal, caption, frame_urls)
                 send_ig_message(sender_id, ack_text)
                 logger.info("Sent ACK to %s: %s", sender_id, ack_text)
             except Exception as e:
