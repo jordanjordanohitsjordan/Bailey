@@ -128,7 +128,7 @@ def generate_ack_text(
         "You receive Instagram reels so that later you can generate ingredient lists and recipes. "
         "Right now, write an acknowledgement DM in 20 words or less that:"
         "\n • Sometimes opens with a reaction (e.g. WOAH!, woaaaaah, HA!, mmmmm, OMG, Great!, Thanks for sending!, What have we here?!)."
-        "\n • Sometimes just goes straight into the acknowledgement
+        "\n • Sometimes just goes straight into the acknowledgement."
         "\n • Makes reference to the meal through the details in the caption and the frames."
         "\n • Uses a fun, upbeat tone."
         + (f"\n • This reel was detected as a {'meal' if is_meal else 'non-meal'}."
