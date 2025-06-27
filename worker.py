@@ -119,43 +119,68 @@ def generate_ack_text(
     frame_urls: list[str]
 ) -> str:
     """
-    Generates a warm, energetic acknowledgement.
-    Reminds the model of its ultimate role: turning reels into recipes.
-    References one phrase from the caption and one visual detail.
-    Ends appropriately for meal vs non-meal.
+    Generates an energetic, example-driven acknowledgement using your custom style examples,
+    and still injects the real caption + frame URLs for the live prompt.
     """
-    logger.info("Generating acknowledgement; caption: %r", caption)
-
-    system_prompt = (
+    # 1) Role-setting system prompt
+    system = (
         "You are a friendly, energetic cooking assistant. "
-        "You receive Instagram cooking reels so that later you can generate "
-        "ingredient lists and step-by-step recipes for them. "
-        "Right now, write an acknowledgement DM:"
-        "\n • You can reference the caption."
-        "\n • You can reference details you saw in the frames."
-        "\n • Use a warm, upbeat tone—fun but not cringe."
-        f"\n • This reel was detected as a {'meal' if is_meal else 'non-meal'}."
-        "\n • Keep it under 50 words."
-        + (
-            "\n • If it’s a meal, end with 'Your recipe is on the way.'"
-            if is_meal
-            else "\n • If it’s not a meal, close with 'Send me another reel anytime!'"
-        )
+        "You receive Instagram reels so that later you can generate ingredient lists and recipes. "
+        "Right now, write an acknowledgement DM that:"
+        "\n • Opens with a punchy reaction if relevant (e.g. WOAH!, woaaaaah, HA!, mmmmm, OMG, Great!)."
+        "\n • Makes reference to details in the caption."
+        "\n • Makes reference to details in the frames."
+        "\n • Uses a fun, upbeat tone."
+        + (f"\n • This reel was detected as a {'meal' if is_meal else 'non-meal'}."
+           f"\n • If it’s a meal, end with a line about the recipe being “on the way.”"
+           if is_meal
+           else "\n • If it’s not a meal, close with an invitation like “Send me another reel anytime!”")
     )
-    logger.info("ACK system prompt: %s", system_prompt)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": f"Caption: “{caption or '(no caption)'}”"},
+    # 2) Your two style examples
+    examples = [
+        {
+            "user": (
+                "Caption: “The perfect burger !! Stacked G.F.C. spicy kimchi marinated chicken…”\n"
+                "Frames: melted cheese dripping; hash brown patty; sesame-seed bun\n"
+                "Write an acknowledgement:"
+            ),
+            "bot": (
+                "WOAH! When Gordon Ramsay says it's a perfect burger, that means it's a perfect burger! "
+                "Let's put a recipe together for this badboy, including that signature G.F.C sauce. "
+                "Wait a moment whilst I cook this up..."
+            )
+        },
+        {
+            "user": (
+                "Caption: “Just a cute pig shredding on a skateboard!”\n"
+                "Frames: pink pig in sunglasses; skate ramp; blue sky\n"
+                "Write an acknowledgement:"
+            ),
+            "bot": (
+                "HA! That pig can RIP. I don't detect a meal in this Reel, though. "
+                "If you want me to share a recipe for a mouth-drooling Reel you've seen, I'm ready. "
+                "Or just keep sending me skateboarding pig videos, I'm happy either way..."
+            )
+        }
     ]
-    for url in frame_urls[:3]:
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
-            ]
-        })
 
+    # 3) Assemble the chat messages
+    messages = [{"role": "system", "content": system}]
+    for ex in examples:
+        messages.append({"role": "user",      "content": ex["user"]})
+        messages.append({"role": "assistant", "content": ex["bot"]})
+
+    # 4) Now inject the *real* caption + frames for the live call
+    live_user = (
+        f"Caption: “{caption or '(no caption)'}”\n"
+        "Frames:\n" +
+        "\n".join(f"- {url}" for url in frame_urls[:3]) +
+        "\nWrite an acknowledgement:"
+    )
+    messages.append({"role": "user", "content": live_user})
+
+    # 5) Call the model
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
