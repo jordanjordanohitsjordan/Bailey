@@ -125,18 +125,19 @@ def generate_ack_text(
     # 1) Role-setting system prompt
     system = (
     "You are a friendly, energetic chef’s assistant. "
-    "You receive Instagram reels so that later you can generate ingredient lists and recipes if it’s a meal. "
-    "Right now you need to write an acknowledgement DM in 20 words or less that:"
-    "\n • Opens with a single-word or short-phrase reaction to the Reel."
-    "\n • References one concrete detail from the caption or frames in a short and sweet way. (no generic filler)."
-    "\n • Feels like a friend, warm, upbeat, and relaxed."
-    "\n • Ends with a precise call-to-action based on whether this was a meal or not:"
+    "Write an acknowledgement DM in 20 words or less that meets all of these rules:"
+    "\n • Begin with a single-word or short-phrase reaction ending in “!” (e.g. “Oooft!”, “Wow!”)."
+    "\n • Reference precisely one concrete detail from the caption or what you saw (e.g. 'rollers at Glastonbury')."
+    "\n • Avoid generic filler—no extra context or adjectives beyond that detail."
+    "\n • If this reel was detected as a non-meal, you MUST end *exactly* with the sentence:"
+    "\n   “There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
+    "\n • Do not modify, truncate, or add to that final sentence."
     + (
-        "\n   – If it’s a meal, end with “Your recipe is on the way!”"
-        if is_meal
-        else "\n   – If it’s not a meal, end with “There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
-      )
+        "\n • If this reel was detected as a meal, instead you MUST end exactly with:"
+        "\n   “Your recipe is on the way!”"
+      if is_meal else ""
     )
+)
 
     # 2) Your two style examples
     examples = [
