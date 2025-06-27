@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # worker.py
 # Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning,
-# send an acknowledgment DM, and record frames for later transcription & recipe generation.
+# extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
+# (with Structured Outputs), send acknowledgement, and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -14,7 +14,6 @@ from pathlib import Path
 import boto3
 import requests
 import openai
-import instagram_api  # your existing IG DM wrapper
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -22,11 +21,13 @@ from sqlalchemy import Table, Column, String, Integer, MetaData, Text
 
 # Load environment variables
 load_dotenv()
-SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")
-S3_BUCKET      = os.getenv("S3_BUCKET_NAME")
-DATABASE_URL   = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AWS_REGION     = os.getenv("AWS_REGION", "us-east-1")
+SQS_QUEUE_URL       = os.getenv("SQS_QUEUE_URL")
+S3_BUCKET           = os.getenv("S3_BUCKET_NAME")
+DATABASE_URL        = os.getenv("DATABASE_URL")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
+AWS_REGION          = os.getenv("AWS_REGION", "us-east-1")
+PAGE_ACCESS_TOKEN   = os.getenv("PAGE_ACCESS_TOKEN")
+IG_API_VERSION      = "v23.0"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,13 +37,13 @@ logger = logging.getLogger("worker")
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3  = boto3.client("s3", region_name=AWS_REGION)
 
-# OpenAI client key
+# OpenAI client
 openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
-engine        = create_async_engine(DATABASE_URL, echo=False)
-async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-metadata      = MetaData()
+engine         = create_async_engine(DATABASE_URL, echo=False)
+async_session  = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+metadata       = MetaData()
 
 # Define tables
 jobs_table = Table(
@@ -62,52 +63,81 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# System prompt for meal detection + acknowledgment
-MEAL_ACK_PROMPT = '''
+# System prompt for meal detection
+MEAL_DETECTION_PROMPT = """
 You are a vision-and-language chef assistant.
 Given images from a cooking reel, decide if it shows a true multi-ingredient “meal”
 vs only snacking, reheating, or single-ingredient treatment.
-
-Then compose a friendly DM:
-- If "is_meal" is true, set "ack_message" to something like:
-  "Thanks for sharing your [dish name]! 🍽️ Your recipe is on its way."
-- If "is_meal" is false, set "ack_message" to:
-  "Looks like this wasn't a full recipe, but thanks for sharing! 😊"
-
-Respond using the following strict JSON schema:
+Respond *only* with JSON matching this schema:
 {
   "type": "object",
   "properties": {
-    "is_meal": { "type": "boolean" },
-    "ack_message": { "type": "string" }
+    "is_meal": { "type": "boolean" }
   },
-  "required": ["is_meal","ack_message"],
+  "required": ["is_meal"],
   "additionalProperties": false
 }
-'''
+"""
 
-# JSON-schema wrapper for structured outputs
-detection_schema = {
+# Pre-built JSON Schema for Structured Outputs
+MEAL_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "meal_ack",
+        "name": "meal_detection",
         "strict": True,
         "schema": {
             "type": "object",
             "properties": {
-                "is_meal": {"type": "boolean"},
-                "ack_message": {"type": "string"}
+                "is_meal": {"type": "boolean"}
             },
-            "required": ["is_meal","ack_message"],
+            "required": ["is_meal"],
             "additionalProperties": False
         }
     }
 }
 
+# Prompts for acknowledgement messages
+ACK_MEAL_PROMPT = """
+You are a friendly assistant. A user has just sent a short cooking video that was detected as a meal. 
+Write them a personalized acknowledgement referencing “the meal you sent” (feel free to mention it was delicious-looking or similar), and tell them: “Your recipe is on the way!”
+Keep it under 50 words.
+"""
+
+ACK_NONMEAL_PROMPT = """
+You are a friendly assistant. A user has just sent a video that wasn’t a multi-ingredient meal. 
+Write them a polite acknowledgement referencing “the video you sent” (you could say you appreciate it), and tell them: “That’s not a recipe, but thanks for sharing!”
+Keep it under 50 words.
+"""
+
+def send_ig_message(recipient_id: str, text: str):
+    """Sends a text DM via the Instagram/FB Send API."""
+    url = f"https://graph.facebook.com/{IG_API_VERSION}/me/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text},
+        "messaging_type": "RESPONSE"
+    }
+    params = {"access_token": PAGE_ACCESS_TOKEN}
+    resp = requests.post(url, params=params, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+def generate_ack_text(is_meal: bool) -> str:
+    """Generates a dynamic acknowledgement message via OpenAI."""
+    system_prompt = ACK_MEAL_PROMPT if is_meal else ACK_NONMEAL_PROMPT
+    resp = openai.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": "Generate the acknowledgement now."}
+        ],
+        temperature=0.7
+    )
+    return resp.choices[0].message.content.strip()
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
-
 
 def download_video(url: str, dest: Path):
     logger.info(f"Downloading video from {url}")
@@ -117,18 +147,13 @@ def download_video(url: str, dest: Path):
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
-
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
-    s3.upload_file(
-        Filename=str(local_path),
-        Bucket=S3_BUCKET,
-        Key=s3_key
-    )
+    s3.upload_file(Filename=str(local_path), Bucket=S3_BUCKET, Key=s3_key)
     return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
-
 def extract_frames(video_path: Path, frames_dir: Path):
+    """Runs ffmpeg once to extract 1fps frames into frames_dir."""
     if any(frames_dir.glob("*.jpg")):
         logger.info("Frames already extracted; skipping")
     else:
@@ -141,33 +166,28 @@ def extract_frames(video_path: Path, frames_dir: Path):
         ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
-
-def detect_and_ack(frames_urls: list[str]) -> tuple[bool,str]:
-    """
-    Call OpenAI with structured outputs to both detect meal and generate DM text.
-    Returns (is_meal, ack_message).
-    """
-    logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames + composing DM")
-    messages = [{"role": "system", "content": MEAL_ACK_PROMPT}]
+def detect_meal(frames_urls: list[str]) -> bool:
+    logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames")
+    messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
     for url in frames_urls:
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text", "text": "frame"},
+                {"type": "text",      "text": "frame"},
                 {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
             ]
         })
-
     resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=messages,
-        response_format=detection_schema,
-        max_tokens=128
+        response_format=MEAL_SCHEMA,
     )
-
-    data = json.loads(resp.choices[0].message.content)
-    return bool(data["is_meal"]), data["ack_message"]
-
+    choice = resp.choices[0].message
+    if getattr(choice, "refusal", None):
+        logger.error("Model refused meal detection: %s", choice.refusal)
+        return False
+    data = json.loads(choice.content)
+    return data["is_meal"]
 
 async def process_job(job_body: dict, receipt_handle: str):
     video_url  = job_body["video_url"]
@@ -187,7 +207,7 @@ async def process_job(job_body: dict, receipt_handle: str):
             raw_key = f"raw/{video_id}.mp4"
             upload_to_s3(video_file, raw_key)
 
-            # 3. Extract frames
+            # 3. Extract frames once
             frames = extract_frames(video_file, tmp / "frames")
 
             # 4. Upload frames & collect URLs
@@ -196,14 +216,23 @@ async def process_job(job_body: dict, receipt_handle: str):
                 key = f"frames/{video_id}/{frame.name}"
                 frame_urls.append(upload_to_s3(frame, key))
 
-            # 5. Detect meal & compose DM
-            is_meal, dm_text = detect_and_ack(frame_urls)
-            instagram_api.send_direct_message(to=sender_id, text=dm_text)
+            # 5. Detect meal
+            is_meal = detect_meal(frame_urls)
 
+            # 6. Send acknowledgement
+            try:
+                ack_text = generate_ack_text(is_meal)
+                send_ig_message(sender_id, ack_text)
+                logger.info("Sent ACK to %s: %s", sender_id, ack_text)
+            except Exception as e:
+                logger.error("Failed to send ACK to %s: %s", sender_id, e)
+
+            # 7. If non-meal, stop here
             if not is_meal:
+                logger.info("NON-MEAL detected; no DB write performed")
                 return
 
-            # 6. Record to database
+            # 8. Record to database
             async with async_session() as session:
                 await session.execute(
                     jobs_table.insert().values(
@@ -223,17 +252,16 @@ async def process_job(job_body: dict, receipt_handle: str):
                         )
                     )
                 await session.commit()
+
             logger.info("Meal frames recorded; ready for transcription & recipe.")
 
     except Exception:
         logger.exception("Error processing job %s", video_id)
 
     finally:
+        # always delete so we don’t reprocess
         try:
-            sqs.delete_message(
-                QueueUrl=SQS_QUEUE_URL,
-                ReceiptHandle=receipt_handle
-            )
+            sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
         except Exception:
             logger.warning("Failed to delete SQS message: %s", receipt_handle)
 
