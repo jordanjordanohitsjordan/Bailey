@@ -3,7 +3,8 @@
 # Background worker to pull jobs from SQS, download videos, upload to S3,
 # extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
 # (with Structured Outputs), send a dynamic acknowledgement referencing both
-# the Reel’s caption and its frames, and record frames for later transcription & recipe generation.
+# the Reel’s caption and its frames (and explicitly marking it as an
+# acknowledgement), and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -28,7 +29,6 @@ DATABASE_URL      = os.getenv("DATABASE_URL")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 AWS_REGION        = os.getenv("AWS_REGION", "us-east-1")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
-# Use latest supported Graph API version (override via env if needed)
 IG_API_VERSION    = os.getenv("GRAPH_API_VERSION", "v23.0")
 
 # Configure logging
@@ -120,22 +120,26 @@ def generate_ack_text(
     frame_urls: list[str]
 ) -> str:
     """Generates a personalized acknowledgement referencing caption & image frames,
-    logging the system prompt for debugging."""
-    # Strong system instruction
+    logging both the caption and the system prompt for debugging."""
+    # Log the raw caption
+    logger.info("Generating acknowledgement; caption: %r", caption)
+
+    # Build a strong system prompt that marks this as an acknowledgement and injects the caption
     system_prompt = (
-        "You are a fun, enthusiastic assistant. "
-        f"A user just sent a cooking reel that was detected as a {'meal' if is_meal else 'non-meal'}. "
-        "You *must* reference at least one phrase exactly from their caption when crafting your reply, "
-        "and also mention something you saw in the frames. Keep it under 50 words."
+        "You are composing an *acknowledgement* message. "
+        f"The user’s caption is: “{caption or '(no caption)'}”. "
+        f"This reel was detected as a {'meal' if is_meal else 'non-meal'}. "
+        "You must reference at least one phrase exactly from their caption, "
+        "and mention something you saw in the frames. "
+        "Keep it under 50 words, and if it's a meal, end with 'Your recipe is on the way.'"
     )
-    # Log out the system prompt for inspection
+
+    # Log the system prompt
     logger.info("ACK system prompt: %s", system_prompt)
 
-    # Build messages
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": f"Here is the caption: “{caption or '(no caption)'}”"},
-    ]
+    # Start the messages list with the system prompt
+    messages = [{"role": "system", "content": system_prompt}]
+
     # Attach up to 3 frames
     for url in frame_urls[:3]:
         messages.append({
@@ -208,6 +212,9 @@ def detect_meal(frames_urls: list[str]) -> bool:
     return data["is_meal"]
 
 async def process_job(job_body: dict, receipt_handle: str):
+    # Log the raw job payload to confirm caption handoff
+    logger.info("Received job_body: %s", job_body)
+
     video_url  = job_body["video_url"]
     sender_id  = job_body["sender_id"]
     message_id = job_body["message_id"]
