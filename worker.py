@@ -3,8 +3,7 @@
 # Background worker to pull jobs from SQS, download videos, upload to S3,
 # extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
 # (with Structured Outputs), send a dynamic acknowledgement referencing both
-# the Reel’s caption and its frames (and explicitly marking it as an
-# acknowledgement), and record frames for later transcription & recipe generation.
+# the Reel’s caption and its frames, and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -122,36 +121,33 @@ def generate_ack_text(
     """
     Generates a warm, energetic acknowledgement.
     Reminds the model of its ultimate role: turning reels into recipes.
-    References exactly one phrase from the caption (in quotes) and one visual detail.
-    If it's a meal, it ends with 'Your recipe is on the way.'
+    References one phrase from the caption and one visual detail.
+    Ends appropriately for meal vs non-meal.
     """
+    logger.info("Generating acknowledgement; caption: %r", caption)
 
     system_prompt = (
         "You are a friendly, energetic cooking assistant. "
         "You receive Instagram cooking reels so that later you can generate "
         "ingredient lists and step-by-step recipes for them. "
         "Right now, write an acknowledgement DM:"
-        "\n • You may reference things in the caption in your acknowledgement."
-        "\n • You may also mention vivid things you saw in the frames."
+        "\n • You can reference the caption."
+        "\n • You can reference details you saw in the frames."
         "\n • Use a warm, upbeat tone—fun but not cringe."
         f"\n • This reel was detected as a {'meal' if is_meal else 'non-meal'}."
         "\n • Keep it under 50 words."
-        + (    # If it’s a meal, instruct the closing line
-            "\n • If it’s a meal, end with something like 'Your recipe is on the way.'"
-          else
-            "\n • If it’s not a meal, close with an invitation like "
-            "'Send me another reel anytime!'"
-          )
+        + (
+            "\n • If it’s a meal, end with 'Your recipe is on the way.'"
+            if is_meal
+            else "\n • If it’s not a meal, close with 'Send me another reel anytime!'"
+        )
     )
     logger.info("ACK system prompt: %s", system_prompt)
 
-    # Supply caption explicitly
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": f"Caption: “{caption or '(no caption)'}”"},
     ]
-
-    # Attach up to 3 frames
     for url in frame_urls[:3]:
         messages.append({
             "role": "user",
@@ -221,7 +217,6 @@ def detect_meal(frames_urls: list[str]) -> bool:
     return data["is_meal"]
 
 async def process_job(job_body: dict, receipt_handle: str):
-    # Log the raw job payload to confirm caption handoff
     logger.info("Received job_body: %s", job_body)
 
     video_url  = job_body["video_url"]
