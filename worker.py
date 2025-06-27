@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # worker.py
+# Background worker to pull jobs from SQS, download videos, upload to S3,
+# extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
+# (with Structured Outputs), and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -58,40 +61,38 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# Structured-Outputs JSON schema for detection + ack
+# System prompt for meal detection
+MEAL_DETECTION_PROMPT = """
+You are a vision-and-language chef assistant.
+Given images from a cooking reel, decide if it shows a true multi-ingredient “meal”
+vs only snacking, reheating, or single-ingredient treatment.
+Respond *only* with JSON matching this schema:
+{
+  "type": "object",
+  "properties": {
+    "is_meal": { "type": "boolean" }
+  },
+  "required": ["is_meal"],
+  "additionalProperties": false
+}
+"""
+
+# Pre-built JSON Schema for Structured Outputs
 MEAL_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "meal_detection_and_ack",
+        "name": "meal_detection",
         "strict": True,
         "schema": {
             "type": "object",
             "properties": {
-                "is_meal": {
-                    "type": "boolean",
-                    "description": "Whether this reel shows a full multi-ingredient meal"
-                },
-                "message": {
-                    "type": "string",
-                    "description": "A friendly DM: if is_meal=true, say ‘thanks, recipe's on the way’; else say ‘sorry, not a meal’"
-                }
+                "is_meal": {"type": "boolean"}
             },
-            "required": ["is_meal", "message"],
+            "required": ["is_meal"],
             "additionalProperties": False
         }
     }
 }
-
-# System prompt for Structured Outputs
-MEAL_PROMPT = """
-You are a friendly Instagram cooking assistant.
-Given these frames from a cooking reel, decide if it shows a true multi-ingredient “meal” vs
-only snacking, reheating, or single-ingredient treatment.
-Then craft a one-sentence DM:
-– If it is a meal, say “Thanks—I see X (reference what they made); your recipe is on the way! 🍳”
-– If not, apologize and say you’ll need a full meal reel next time.
-Respond only with valid JSON matching the schema.
-"""
 
 async def init_db():
     async with engine.begin() as conn:
@@ -102,19 +103,16 @@ def download_video(url: str, dest: Path):
     resp = requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
     with open(dest, "wb") as f:
-        for chunk in resp.iter_content(8192):
+        for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
     logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
-    s3.upload_file(
-        Filename=str(local_path),
-        Bucket=S3_BUCKET,
-        Key=s3_key
-    )
+    s3.upload_file(Filename=str(local_path), Bucket=S3_BUCKET, Key=s3_key)
     return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
+    """Runs ffmpeg once to extract 1fps frames into frames_dir."""
     if any(frames_dir.glob("*.jpg")):
         logger.info("Frames already extracted; skipping")
     else:
@@ -122,37 +120,41 @@ def extract_frames(video_path: Path, frames_dir: Path):
         frames_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run([
             "ffmpeg", "-i", str(video_path),
-            "-vf", "fps=1", str(frames_dir / "%04d.jpg")
+            "-vf", "fps=1",
+            str(frames_dir / "%04d.jpg")
         ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
-def detect_and_ack(frame_urls: list[str]) -> tuple[bool,str]:
-    """
-    Calls OpenAI with Structured Outputs to both detect meal vs non-meal
-    AND craft the acknowledgement DM in one go.
-    Returns (is_meal, message).
-    """
-    messages = [
-        {"role": "system",  "content": MEAL_PROMPT},
-    ]
-    for url in frame_urls:
+def detect_meal(frames_urls: list[str]) -> bool:
+    logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames")
+
+    # Build messages
+    messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
+    for url in frames_urls:
         messages.append({
             "role": "user",
             "content": [
-                {"type": "text",    "text": "frame"},
-                {"type": "image_url","image_url": {"url": url, "detail": "low"}}
+                {"type": "text",     "text": "frame"},
+                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
             ]
         })
 
+    # Call OpenAI with Structured Outputs
     resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=messages,
         response_format=MEAL_SCHEMA,
-        max_tokens=80
     )
-    content = resp.choices[0].message.content
-    data = json.loads(content)
-    return data["is_meal"], data["message"]
+    choice = resp.choices[0].message
+
+    # Only treat as refusal if there's a non-empty refusal string
+    if getattr(choice, "refusal", None):
+        logger.error("Model refused meal detection: %s", choice.refusal)
+        return False
+
+    # Guaranteed to match our schema
+    data = json.loads(choice.content)
+    return data["is_meal"]
 
 async def process_job(job_body: dict, receipt_handle: str):
     video_url  = job_body["video_url"]
@@ -172,7 +174,7 @@ async def process_job(job_body: dict, receipt_handle: str):
             raw_key = f"raw/{video_id}.mp4"
             upload_to_s3(video_file, raw_key)
 
-            # 3. Extract frames
+            # 3. Extract frames once
             frames = extract_frames(video_file, tmp / "frames")
 
             # 4. Upload frames & collect URLs
@@ -181,16 +183,13 @@ async def process_job(job_body: dict, receipt_handle: str):
                 key = f"frames/{video_id}/{frame.name}"
                 frame_urls.append(upload_to_s3(frame, key))
 
-            # 5. Detect & acknowledge
-            is_meal, dm_text = detect_and_ack(frame_urls)
-            # send their DM
-            instagram_api.send_direct_message(to=sender_id, text=dm_text)
-
-            if not is_meal:
-                logger.info("Non-meal; halting further processing.")
+            # 5. Detect meal
+            if not detect_meal(frame_urls):
+                logger.info("NON-MEAL detected; sending fallback DM.")
+                # TODO: send fallback DM via Instagram API
                 return
 
-            # 6. Record to database for further transcription & recipe steps
+            # 6. Record to database
             async with async_session() as session:
                 await session.execute(
                     jobs_table.insert().values(
@@ -210,13 +209,14 @@ async def process_job(job_body: dict, receipt_handle: str):
                         )
                     )
                 await session.commit()
+
             logger.info("Meal frames recorded; ready for transcription & recipe.")
 
     except Exception:
         logger.exception("Error processing job %s", video_id)
 
     finally:
-        # always delete so we don’t loop on failure
+        # always delete so we don’t reprocess
         try:
             sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
         except Exception:
