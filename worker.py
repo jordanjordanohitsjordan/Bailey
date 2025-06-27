@@ -119,26 +119,37 @@ def generate_ack_text(
     caption: str,
     frame_urls: list[str]
 ) -> str:
-    """Generates a personalized acknowledgement referencing caption & image frames,
-    logging both the caption and the system prompt for debugging."""
-    # Log the raw caption
-    logger.info("Generating acknowledgement; caption: %r", caption)
+    """
+    Generates a warm, energetic acknowledgement.
+    Reminds the model of its ultimate role: turning reels into recipes.
+    References exactly one phrase from the caption (in quotes) and one visual detail.
+    If it's a meal, it ends with 'Your recipe is on the way.'
+    """
 
-    # Build a strong system prompt that marks this as an acknowledgement and injects the caption
     system_prompt = (
-        "You are composing an *acknowledgement* message. "
-        f"The user’s caption is: “{caption or '(no caption)'}”. "
-        f"This reel was detected as a {'meal' if is_meal else 'non-meal'}. "
-        "You must reference at least one phrase exactly from their caption, "
-        "and mention something you saw in the frames. "
-        "Keep it under 50 words, and if it's a meal, end with 'Your recipe is on the way.'"
+        "You are a friendly, energetic cooking assistant. "
+        "You receive Instagram cooking reels so that later you can generate "
+        "ingredient lists and step-by-step recipes for them. "
+        "Right now, write an acknowledgement DM:"
+        "\n • You may reference things in the caption in your acknowledgement."
+        "\n • You may also mention vivid things you saw in the frames."
+        "\n • Use a warm, upbeat tone—fun but not cringe."
+        f"\n • This reel was detected as a {'meal' if is_meal else 'non-meal'}."
+        "\n • Keep it under 50 words."
+        + (    # If it’s a meal, instruct the closing line
+            "\n • If it’s a meal, end with something like 'Your recipe is on the way.'"
+          else
+            "\n • If it’s not a meal, close with an invitation like "
+            "'Send me another reel anytime!'"
+          )
     )
-
-    # Log the system prompt
     logger.info("ACK system prompt: %s", system_prompt)
 
-    # Start the messages list with the system prompt
-    messages = [{"role": "system", "content": system_prompt}]
+    # Supply caption explicitly
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": f"Caption: “{caption or '(no caption)'}”"},
+    ]
 
     # Attach up to 3 frames
     for url in frame_urls[:3]:
@@ -149,11 +160,9 @@ def generate_ack_text(
             ]
         })
 
-    # Call OpenAI
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
-        temperature=0.8
     )
     return resp.choices[0].message.content.strip()
 
