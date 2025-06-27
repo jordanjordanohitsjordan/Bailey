@@ -127,8 +127,8 @@ def generate_ack_text(
     "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial text-speak way. "
     "Write an acknowledgement in a maximum of 20 words that follows these rules:"
     "\n • Reference one concrete detail you saw or read—"
-    " for a meal, name the dish and one detail about it, use a single relevant emoji;"
-    " for a non-meal, reference the subject of the Reel, use a single relevant emoji."
+    " for a meal, name the dish and one detail about it, use a single relevant ios emoji;"
+    " for a non-meal, reference the subject of the Reel, use a single relevant ios emoji."
     "\n • End with the exact closing based on type:"
     + (
         "\n   – Meal: “Your recipe is on the way!”"
