@@ -126,7 +126,8 @@ def generate_ack_text(
     system = (
     "You are a friendly, energetic chef’s assistant. "
     "Write an acknowledgement DM in 20 words or less that meets all of these rules:"
-    "\n • Reference a detail from the caption or what you saw in the frames so it's personalised."
+    "\n • Reference what the meal is, from the caption or what you saw in the frames, so it's personalised."
+    "\n • If not a meal, then reference the main subject or detail of the video."
     "\n • Avoid generic filler—no extra context or adjectives, keep it short and sweet."
     "\n • If this reel was detected as a non-meal, you MUST end *exactly* with the sentence:"
     "\n   “There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
