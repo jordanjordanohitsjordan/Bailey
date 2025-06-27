@@ -98,21 +98,6 @@ MEAL_SCHEMA = {
     }
 }
 
-# Prompts for dynamic acknowledgement messages
-ACK_MEAL_PROMPT = """
-You are a fun, enthusiastic assistant. A user just sent a cooking reel that was detected as a meal.
-They captioned: "{caption}"
-You also saw the following frames.
-Write a playful, personalized acknowledgement referencing both what you read in the caption and what you saw in the images, and tell them their recipe is on the way. Keep it under 50 words.
-"""
-
-ACK_NONMEAL_PROMPT = """
-You are a witty, friendly assistant. A user just sent a reel that wasn’t a meal.
-They captioned: "{caption}"
-You also saw the following frames.
-Write a humorous, polite acknowledgement referencing both what they wrote and what you saw, and note there’s no meal here. Keep it under 50 words.
-"""
-
 def send_ig_message(recipient_id: str, text: str):
     """Sends a basic text DM via the Instagram Graph API as form data."""
     url = f"https://graph.facebook.com/{IG_API_VERSION}/me/messages"
@@ -134,13 +119,24 @@ def generate_ack_text(
     caption: str,
     frame_urls: list[str]
 ) -> str:
-    """Generates a personalized acknowledgement referencing caption & image frames."""
-    # Format system prompt with the caption
-    raw_prompt = ACK_MEAL_PROMPT if is_meal else ACK_NONMEAL_PROMPT
-    system_prompt = raw_prompt.format(caption=caption or "(no caption)")
+    """Generates a personalized acknowledgement referencing caption & image frames,
+    logging the system prompt for debugging."""
+    # Strong system instruction
+    system_prompt = (
+        "You are a fun, enthusiastic assistant. "
+        f"A user just sent a cooking reel that was detected as a {'meal' if is_meal else 'non-meal'}. "
+        "You *must* reference at least one phrase exactly from their caption when crafting your reply, "
+        "and also mention something you saw in the frames. Keep it under 50 words."
+    )
+    # Log out the system prompt for inspection
+    logger.info("ACK system prompt: %s", system_prompt)
 
-    # Build messages: system prompt + up to 3 frames
-    messages = [{"role": "system", "content": system_prompt}]
+    # Build messages
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": f"Here is the caption: “{caption or '(no caption)'}”"},
+    ]
+    # Attach up to 3 frames
     for url in frame_urls[:3]:
         messages.append({
             "role": "user",
@@ -149,6 +145,7 @@ def generate_ack_text(
             ]
         })
 
+    # Call OpenAI
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
