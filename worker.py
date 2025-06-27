@@ -21,13 +21,14 @@ from sqlalchemy import Table, Column, String, Integer, MetaData, Text
 
 # Load environment variables
 load_dotenv()
-SQS_QUEUE_URL       = os.getenv("SQS_QUEUE_URL")
-S3_BUCKET           = os.getenv("S3_BUCKET_NAME")
-DATABASE_URL        = os.getenv("DATABASE_URL")
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
-AWS_REGION          = os.getenv("AWS_REGION", "us-east-1")
-PAGE_ACCESS_TOKEN   = os.getenv("PAGE_ACCESS_TOKEN")
-IG_API_VERSION      = "v23.0"
+SQS_QUEUE_URL     = os.getenv("SQS_QUEUE_URL")
+S3_BUCKET         = os.getenv("S3_BUCKET_NAME")
+DATABASE_URL      = os.getenv("DATABASE_URL")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+AWS_REGION        = os.getenv("AWS_REGION", "us-east-1")
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
+# Use latest supported Graph API version (override via env if needed)
+IG_API_VERSION    = os.getenv("GRAPH_API_VERSION", "v29.0")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,9 +42,9 @@ s3  = boto3.client("s3", region_name=AWS_REGION)
 openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
-engine         = create_async_engine(DATABASE_URL, echo=False)
-async_session  = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-metadata       = MetaData()
+engine        = create_async_engine(DATABASE_URL, echo=False)
+async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+metadata      = MetaData()
 
 # Define tables
 jobs_table = Table(
@@ -110,15 +111,15 @@ Keep it under 50 words.
 """
 
 def send_ig_message(recipient_id: str, text: str):
-    """Sends a text DM via the Instagram/FB Send API."""
+    """Sends a text DM via the Instagram/FB Send API using a supported Graph API version."""
     url = f"https://graph.facebook.com/{IG_API_VERSION}/me/messages"
+    headers = {"Authorization": f"Bearer {PAGE_ACCESS_TOKEN}"}
     payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE"
+        "recipient":      {"id": recipient_id},
+        "message":        {"text": text},
+        "messaging_type": "RESPONSE",
     }
-    params = {"access_token": PAGE_ACCESS_TOKEN}
-    resp = requests.post(url, params=params, json=payload, timeout=10)
+    resp = requests.post(url, headers=headers, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -264,7 +265,6 @@ async def process_job(job_body: dict, receipt_handle: str):
             sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
         except Exception:
             logger.warning("Failed to delete SQS message: %s", receipt_handle)
-
 
 if __name__ == "__main__":
     import asyncio
