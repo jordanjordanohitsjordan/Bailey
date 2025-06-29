@@ -7,3 +7,8 @@ requests
 sqlalchemy
 asyncmy  # or aiomysql, depending on your MySQL driver
 openai
+numpy
+ffmpeg-python
+librosa
+torch
+panns_inference
