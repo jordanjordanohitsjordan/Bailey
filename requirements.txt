@@ -12,3 +12,4 @@ ffmpeg-python
 librosa
 torch
 panns_inference
+panns-inference

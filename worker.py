@@ -46,7 +46,12 @@ s3  = boto3.client("s3", region_name=AWS_REGION)
 openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
-engine         = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,       # check connection liveness before using it
+    pool_recycle=3600         # (optional) recycle connections every hour
+)
 async_session  = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 metadata       = MetaData()
 
