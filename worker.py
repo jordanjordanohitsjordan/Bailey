@@ -3,8 +3,7 @@
 # Background worker to pull jobs from SQS, download videos, upload to S3,
 # extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
 # (with Structured Outputs), send a dynamic acknowledgement referencing both
-# the Reel’s caption and its frames, then—if it’s a meal—classify & transcribe
-# audio, generate ingredients & recipe steps via OpenAI, and DM them.
+# the Reel’s caption and its frames, and record frames for later transcription & recipe generation.
 
 import os
 import json
@@ -20,9 +19,6 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import Table, Column, String, Integer, MetaData, Text
-
-# Import your voice classification helper
-import voicecheck  # voicecheck.py must live alongside this file
 
 # Load environment variables
 load_dotenv()
@@ -46,12 +42,7 @@ s3  = boto3.client("s3", region_name=AWS_REGION)
 openai.api_key = OPENAI_API_KEY
 
 # Database setup (async SQLAlchemy)
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,       # check connection liveness before using it
-    pool_recycle=3600         # (optional) recycle connections every hour
-)
+engine         = create_async_engine(DATABASE_URL, echo=False)
 async_session  = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 metadata       = MetaData()
 
@@ -122,49 +113,31 @@ def send_ig_message(recipient_id: str, text: str):
     resp.raise_for_status()
     return resp.json()
 
-def chunk_and_send(recipient_id: str, text: str, max_len: int = 1000):
-    """Split a long text into <= max_len chunks at sentence boundaries and send sequentially."""
-    sentences = text.split('. ')
-    chunk = ""
-    for sentence in sentences:
-        candidate = (chunk + '. ' + sentence) if chunk else sentence
-        if len(candidate) <= max_len:
-            chunk = candidate
-        else:
-            send_ig_message(recipient_id, chunk.strip() + '.')
-            chunk = sentence
-    if chunk:
-        if not chunk.endswith('.'):
-            chunk += '.'
-        send_ig_message(recipient_id, chunk.strip())
-
-def transcribe_audio(video_fp: Path) -> str:
-    """Extracts audio from video_fp and runs Whisper to return transcript text."""
-    with tempfile.TemporaryDirectory() as td:
-        wav_fp = os.path.join(td, "tmp.wav")
-        # reuse voicecheck’s extraction
-        voicecheck._extract_wav(str(video_fp), wav_fp)
-        with open(wav_fp, "rb") as audio_file:
-            resp = openai.Audio.transcribe("whisper-1", audio_file)
-        return resp.get("text", "").strip()
-
 def generate_ack_text(
     is_meal: bool,
     caption: str,
     frame_urls: list[str]
 ) -> str:
     """
-    Generates an energetic acknowledgement using few-shot examples and the real caption+frames.
+    Generates an energetic, example-driven acknowledgement using your custom style examples,
+    and still injects the real caption + frame URLs for the live prompt.
     """
+    # 1) Role-setting system prompt
     system = (
-        "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial UK text-speak way, "
-        "casually cool but not cringe. Write an acknowledgement in up to 20 words that:"
-        "\n • References one concrete detail: for a meal, name the dish & one detail + emoji; "
-          "for a non-meal, name the main subject + emoji."
-        "\n • Ends exactly with: "
-        + ("“Your recipe is on the way!”" if is_meal
-           else "“There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”")
-    )
+    "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial UK text-speak way, but don't use cringe language, be casually cool, and don't use em dashes. "
+    "Write an acknowledgement in a maximum of 20 words that follows these rules:"
+    "\n • Reference one concrete detail you saw or read—"
+    " for a meal, name the dish and one detail about it, use a single relevant ios emoji;"
+    " for a non-meal, reference the subject of the Reel, use a single relevant ios emoji."
+    "\n • End with the exact closing based on type:"
+    + (
+        "\n   – Meal: “Your recipe is on the way!”"
+        if is_meal
+        else "\n   – Non-meal: “There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
+      )
+)
+
+    # 2) Your two style examples
     examples = [
         {
             "user": (
@@ -173,8 +146,9 @@ def generate_ack_text(
                 "Write an acknowledgement:"
             ),
             "bot": (
-                "WOAH! That spicy kimchi chicken 🍔 looks insane—"
-                "let’s get your recipe on the way!"
+                "WOAH! When Gordon Ramsay says it's a perfect burger, that means it's a perfect burger! "
+                "Let's put a recipe together for this badboy, including that signature G.F.C sauce. "
+                "Wait a moment whilst I cook this up..."
             )
         },
         {
@@ -184,15 +158,20 @@ def generate_ack_text(
                 "Write an acknowledgement:"
             ),
             "bot": (
-                "HA! That pink pig 🐷 shred those ramps—there’s no meal here, "
-                "but send me a tasty food Reel anytime and I’ll be happy to share the recipe!"
+                "HA! That pig can RIP. I don't detect a meal in this Reel, though. "
+                "If you want me to share a recipe for a mouth-drooling Reel you've seen, I'm ready. "
+                "Or just keep sending me skateboarding pig videos, I'm happy either way..."
             )
         }
     ]
+
+    # 3) Assemble the chat messages
     messages = [{"role": "system", "content": system}]
     for ex in examples:
         messages.append({"role": "user",      "content": ex["user"]})
         messages.append({"role": "assistant", "content": ex["bot"]})
+
+    # 4) Now inject the *real* caption + frames for the live call
     live_user = (
         f"Caption: “{caption or '(no caption)'}”\n"
         "Frames:\n" +
@@ -201,66 +180,12 @@ def generate_ack_text(
     )
     messages.append({"role": "user", "content": live_user})
 
+    # 5) Call the model
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
-        temperature=0.9
     )
     return resp.choices[0].message.content.strip()
-
-def generate_recipe(
-    caption: str,
-    frame_urls: list[str],
-    transcript: str
-) -> dict:
-    """
-    Generates ingredients & method JSON via Structured Outputs.
-    Uses caption, frames, and transcript as sources, filling any gaps.
-    """
-    system = (
-        "You are a detailed chef assistant. Now generate a JSON object with:"
-        "\n - ingredients: an array of ingredient strings"
-        "\n - method: an array of step-by-step instruction strings"
-        "\nUse the caption, the transcript, and the visible frames as your source. "
-        "Be as faithful as possible, but fill in any missing cooking steps or ingredients logically."
-    )
-    schema = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "recipe",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "ingredients": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "method": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    }
-                },
-                "required": ["ingredients", "method"],
-                "additionalProperties": False
-            }
-        }
-    }
-    messages = [{"role": "system", "content": system}]
-    messages.append({"role": "user", "content": f"Caption: “{caption or '(no caption)'}”"})
-    if transcript:
-        messages.append({"role": "user", "content": f"Transcript: {transcript}"})
-    messages.append({
-        "role": "user",
-        "content": "Frames:\n" + "\n".join(f"- {url}" for url in frame_urls[:5])
-    })
-
-    resp = openai.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        response_format=schema,
-        temperature=0.7
-    )
-    return json.loads(resp.choices[0].message.content)
 
 async def init_db():
     async with engine.begin() as conn:
@@ -337,51 +262,32 @@ async def process_job(job_body: dict, receipt_handle: str):
             raw_key = f"raw/{video_id}.mp4"
             upload_to_s3(video_file, raw_key)
 
-            # 3. Classify & possibly transcribe audio
-            audio_cls = voicecheck.classify(str(video_file))
-            logger.info("Audio classification: %s", audio_cls)
-            transcript = ""
-            if audio_cls in ("vo_only", "instr_vo"):
-                transcript = transcribe_audio(video_file)
-                logger.info("Transcript: %s", transcript)
-
-            # 4. Extract frames once
+            # 3. Extract frames once
             frames = extract_frames(video_file, tmp / "frames")
 
-            # 5. Upload frames & collect URLs
+            # 4. Upload frames & collect URLs
             frame_urls = []
             for frame in frames:
                 key = f"frames/{video_id}/{frame.name}"
                 frame_urls.append(upload_to_s3(frame, key))
 
-            # 6. Detect meal
+            # 5. Detect meal
             is_meal = detect_meal(frame_urls)
 
-            # 7. Send acknowledgement
+            # 6. Send dynamic acknowledgement
             try:
-                ack = generate_ack_text(is_meal, caption, frame_urls)
-                send_ig_message(sender_id, ack)
-                logger.info("Sent ACK to %s: %s", sender_id, ack)
+                ack_text = generate_ack_text(is_meal, caption, frame_urls)
+                send_ig_message(sender_id, ack_text)
+                logger.info("Sent ACK to %s: %s", sender_id, ack_text)
             except Exception as e:
                 logger.error("Failed to send ACK to %s: %s", sender_id, e)
 
-            # 8. If non-meal, stop here
+            # 7. If non-meal, stop here
             if not is_meal:
-                logger.info("NON-MEAL detected; no DB write or recipe generation")
+                logger.info("NON-MEAL detected; no DB write performed")
                 return
 
-            # 9. Generate recipe JSON
-            recipe = generate_recipe(caption, frame_urls, transcript)
-
-            # 10. Send ingredients list
-            ingredients_text = "Ingredients:\n" + "\n".join(f"- {i}" for i in recipe["ingredients"])
-            send_ig_message(sender_id, ingredients_text)
-
-            # 11. Send method in chunks
-            method_text = "Method:\n" + " ".join(recipe["method"])
-            chunk_and_send(sender_id, method_text)
-
-            # 12. Record to database
+            # 8. Record to database
             async with async_session() as session:
                 await session.execute(
                     jobs_table.insert().values(
@@ -402,7 +308,7 @@ async def process_job(job_body: dict, receipt_handle: str):
                     )
                 await session.commit()
 
-            logger.info("Recipe sent; frames recorded for transcription & further steps.")
+            logger.info("Meal frames recorded; ready for transcription & recipe.")
 
     except Exception:
         logger.exception("Error processing job %s", video_id)
