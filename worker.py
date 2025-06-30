@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # worker.py
-# Background worker to pull jobs from SQS, download videos, upload to S3,
-# extract frames (once), decide meal vs non-meal via OpenAI Vision+Reasoning
-# (with Structured Outputs), send a dynamic acknowledgement referencing both
-# the Reel’s caption and its frames, and record frames for later transcription & recipe generation.
+# Background worker:
+#   1. Pull SQS jobs
+#   2. Download video → upload to S3
+#   3. Extract 1 fps frames → upload to S3
+#   4. Decide meal vs non-meal with Vision + Structured Outputs
+#   5. Send dynamic IG DM acknowledgement
+#   6. If meal: extract ingredients & recipe with Vision + Structured Outputs
+#   7. Persist metadata (video + frames)      [recipe JSON left for later]
+#   8. Delete SQS message
 
 import os
 import json
@@ -20,7 +25,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import Table, Column, String, Integer, MetaData, Text
 
-# Load environment variables
+# ──────────────────── ENV & LOGGING ────────────────────────────
 load_dotenv()
 SQS_QUEUE_URL     = os.getenv("SQS_QUEUE_URL")
 S3_BUCKET         = os.getenv("S3_BUCKET_NAME")
@@ -30,23 +35,20 @@ AWS_REGION        = os.getenv("AWS_REGION", "us-east-1")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 IG_API_VERSION    = os.getenv("GRAPH_API_VERSION", "v23.0")
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
 
-# AWS clients
+# ──────────────────── AWS & OPENAI CLIENTS ─────────────────────
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 s3  = boto3.client("s3", region_name=AWS_REGION)
 
-# OpenAI client
 openai.api_key = OPENAI_API_KEY
 
-# Database setup (async SQLAlchemy)
+# ──────────────────── DATABASE SETUP ───────────────────────────
 engine         = create_async_engine(DATABASE_URL, echo=False)
 async_session  = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 metadata       = MetaData()
 
-# Define tables
 jobs_table = Table(
     "video_jobs", metadata,
     Column("id",         Integer, primary_key=True),
@@ -55,7 +57,9 @@ jobs_table = Table(
     Column("raw_s3_key", String(255)),
     Column("sender_id",  String(255)),
     Column("status",     String(50)),
+    # Add recipe_json column later when you migrate the DB
 )
+
 frames_table = Table(
     "video_frames", metadata,
     Column("id",           Integer, primary_key=True),
@@ -64,7 +68,7 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-# System prompt for meal detection
+# ──────────────────── PROMPTS & SCHEMAS ────────────────────────
 MEAL_DETECTION_PROMPT = """
 You are a vision-and-language chef assistant.
 Given images from a cooking reel, decide if it shows a true multi-ingredient “meal”
@@ -80,7 +84,6 @@ Respond *only* with JSON matching this schema:
 }
 """
 
-# JSON Schema for Structured Outputs
 MEAL_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -97,8 +100,41 @@ MEAL_SCHEMA = {
     }
 }
 
+RECIPE_SYSTEM_PROMPT = (
+    "You are a culinary vision expert. "
+    "Given EVERY frame of a cooking reel and its Instagram caption, output a JSON object "
+    "with: (1) INGREDIENTS – distinct, singular nouns, order of appearance; "
+    "(2) RECIPE_STEPS – up to ~8 concise numbered instructions. "
+    "Do **not** add any keys beyond the schema."
+)
+
+RECIPE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "recipe_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "ingredients": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Distinct ingredients in order of appearance"
+                },
+                "recipe_steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Concise cooking instructions"
+                }
+            },
+            "required": ["ingredients", "recipe_steps"],
+            "additionalProperties": False
+        }
+    }
+}
+
+# ──────────────────── IG HELPER ────────────────────────────────
 def send_ig_message(recipient_id: str, text: str):
-    """Sends a basic text DM via the Instagram Graph API as form data."""
     url = f"https://graph.facebook.com/{IG_API_VERSION}/me/messages"
     data = {
         "recipient": json.dumps({"id": recipient_id}),
@@ -113,31 +149,20 @@ def send_ig_message(recipient_id: str, text: str):
     resp.raise_for_status()
     return resp.json()
 
-def generate_ack_text(
-    is_meal: bool,
-    caption: str,
-    frame_urls: list[str]
-) -> str:
-    """
-    Generates an energetic, example-driven acknowledgement using your custom style examples,
-    and still injects the real caption + frame URLs for the live prompt.
-    """
-    # 1) Role-setting system prompt
+# ──────────────────── ACKNOWLEDGEMENT TEXT ─────────────────────
+def generate_ack_text(is_meal: bool, caption: str, frame_urls: list[str]) -> str:
     system = (
-    "You are a friendly, energetic chef’s assistant DM’ing a friend in a colloquial UK text-speak way, but don't use cringe language, be casually cool, and don't use em dashes. "
-    "Write an acknowledgement in a maximum of 20 words that follows these rules:"
-    "\n • Reference one concrete detail you saw or read—"
-    " for a meal, name the dish and one detail about it, use a single relevant ios emoji;"
-    " for a non-meal, reference the subject of the Reel, use a single relevant ios emoji."
-    "\n • End with the exact closing based on type:"
-    + (
-        "\n   – Meal: “Your recipe is on the way!”"
-        if is_meal
-        else "\n   – Non-meal: “There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
-      )
-)
+        "You are a friendly, energetic chef’s assistant DM’ing a friend in colloquial UK text-speak, "
+        "never cringe, max 20 words, no em dashes. "
+        "• Reference one concrete detail you saw/read. "
+        "• Use ONE relevant iOS emoji. "
+        "• End exactly with: "
+        + (
+            "“Your recipe is on the way!”" if is_meal else
+            "“There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!”"
+        )
+    )
 
-    # 2) Your two style examples
     examples = [
         {
             "user": (
@@ -146,9 +171,7 @@ def generate_ack_text(
                 "Write an acknowledgement:"
             ),
             "bot": (
-                "WOAH! When Gordon Ramsay says it's a perfect burger, that means it's a perfect burger! "
-                "Let's put a recipe together for this badboy, including that signature G.F.C sauce. "
-                "Wait a moment whilst I cook this up..."
+                "WOAH! When Gordon Ramsay says it's a perfect burger, melted cheese never lies 🍔 Your recipe is on the way!"
             )
         },
         {
@@ -158,20 +181,16 @@ def generate_ack_text(
                 "Write an acknowledgement:"
             ),
             "bot": (
-                "HA! That pig can RIP. I don't detect a meal in this Reel, though. "
-                "If you want me to share a recipe for a mouth-drooling Reel you've seen, I'm ready. "
-                "Or just keep sending me skateboarding pig videos, I'm happy either way..."
+                "That pig absolutely rips 🛹 There’s no meal here, but send me a tasty food Reel anytime and I’ll be happy to share the recipe!"
             )
         }
     ]
 
-    # 3) Assemble the chat messages
     messages = [{"role": "system", "content": system}]
     for ex in examples:
         messages.append({"role": "user",      "content": ex["user"]})
         messages.append({"role": "assistant", "content": ex["bot"]})
 
-    # 4) Now inject the *real* caption + frames for the live call
     live_user = (
         f"Caption: “{caption or '(no caption)'}”\n"
         "Frames:\n" +
@@ -180,19 +199,20 @@ def generate_ack_text(
     )
     messages.append({"role": "user", "content": live_user})
 
-    # 5) Call the model
     resp = openai.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
     )
     return resp.choices[0].message.content.strip()
 
+# ──────────────────── DB INIT ──────────────────────────────────
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
 
+# ──────────────────── VIDEO/IMAGE UTILS ────────────────────────
 def download_video(url: str, dest: Path):
-    logger.info(f"Downloading video from {url}")
+    logger.info("Downloading video from %s", url)
     resp = requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
     with open(dest, "wb") as f:
@@ -200,16 +220,15 @@ def download_video(url: str, dest: Path):
             f.write(chunk)
 
 def upload_to_s3(local_path: Path, s3_key: str) -> str:
-    logger.info(f"Uploading {local_path.name} to s3://{S3_BUCKET}/{s3_key}")
+    logger.info("Uploading %s to s3://%s/%s", local_path.name, S3_BUCKET, s3_key)
     s3.upload_file(Filename=str(local_path), Bucket=S3_BUCKET, Key=s3_key)
     return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
 
 def extract_frames(video_path: Path, frames_dir: Path):
-    """Runs ffmpeg once to extract 1fps frames into frames_dir."""
     if any(frames_dir.glob("*.jpg")):
         logger.info("Frames already extracted; skipping")
     else:
-        logger.info(f"Extracting frames from {video_path.name}")
+        logger.info("Extracting frames from %s", video_path.name)
         frames_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run([
             "ffmpeg", "-i", str(video_path),
@@ -218,8 +237,9 @@ def extract_frames(video_path: Path, frames_dir: Path):
         ], check=True)
     return sorted(frames_dir.glob("*.jpg"))
 
+# ──────────────────── MEAL VS NON-MEAL ─────────────────────────
 def detect_meal(frames_urls: list[str]) -> bool:
-    logger.info(f"Detecting meal vs non-meal over {len(frames_urls)} frames")
+    logger.info("Detecting meal vs non-meal over %d frames", len(frames_urls))
     messages = [{"role": "system", "content": MEAL_DETECTION_PROMPT}]
     for url in frames_urls:
         messages.append({
@@ -241,8 +261,35 @@ def detect_meal(frames_urls: list[str]) -> bool:
     data = json.loads(choice.content)
     return data["is_meal"]
 
+# ──────────────────── NEW: RECIPE EXTRACTION ───────────────────
+def extract_recipe(caption: str, frames_urls: list[str]) -> dict:
+    """Return {'ingredients': [...], 'recipe_steps': [...]} using all frames + caption."""
+    logger.info("Extracting recipe from %d frames", len(frames_urls))
+    messages = [{"role": "system", "content": RECIPE_SYSTEM_PROMPT}]
+    messages.append({"role": "user", "content": f"CAPTION:\n{caption or '(no caption)'}"})
+
+    for url in frames_urls:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "frame"},
+                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+            ]
+        })
+
+    resp = openai.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        response_format=RECIPE_SCHEMA,
+    )
+    choice = resp.choices[0].message
+    if getattr(choice, "refusal", None):
+        raise RuntimeError(f"Model refusal: {choice.refusal}")
+    return json.loads(choice.content)
+
+# ──────────────────── MAIN JOB PROCESSOR ───────────────────────
 async def process_job(job_body: dict, receipt_handle: str):
-    logger.info("Received job_body: %s", job_body)
+    logger.info("Processing job: %s", job_body)
 
     video_url  = job_body["video_url"]
     sender_id  = job_body["sender_id"]
@@ -280,14 +327,23 @@ async def process_job(job_body: dict, receipt_handle: str):
                 send_ig_message(sender_id, ack_text)
                 logger.info("Sent ACK to %s: %s", sender_id, ack_text)
             except Exception as e:
-                logger.error("Failed to send ACK to %s: %s", sender_id, e)
+                logger.error("Failed to send ACK: %s", e)
+
+            # 6b. If meal, extract recipe
+            recipe_data = None
+            if is_meal:
+                try:
+                    recipe_data = extract_recipe(caption, frame_urls)
+                    logger.info("Recipe extracted: %s", recipe_data)
+                except Exception as e:
+                    logger.error("Recipe extraction failed: %s", e)
 
             # 7. If non-meal, stop here
             if not is_meal:
                 logger.info("NON-MEAL detected; no DB write performed")
                 return
 
-            # 8. Record to database
+            # 8. Record to database (recipe_json column can be added later)
             async with async_session() as session:
                 await session.execute(
                     jobs_table.insert().values(
@@ -295,7 +351,8 @@ async def process_job(job_body: dict, receipt_handle: str):
                         video_url=video_url,
                         raw_s3_key=raw_key,
                         sender_id=sender_id,
-                        status="meal_detected"
+                        status="meal_detected",
+                        # recipe_json=json.dumps(recipe_data) if recipe_data else None,
                     )
                 )
                 for idx, url in enumerate(frame_urls, start=1):
@@ -314,12 +371,12 @@ async def process_job(job_body: dict, receipt_handle: str):
         logger.exception("Error processing job %s", video_id)
 
     finally:
-        # always delete so we don’t reprocess
         try:
             sqs.delete_message(QueueUrl=SQS_QUEUE_URL, ReceiptHandle=receipt_handle)
         except Exception:
-            logger.warning("Failed to delete SQS message: %s", receipt_handle)
+            logger.warning("Failed to delete SQS message %s", receipt_handle)
 
+# ──────────────────── RUNNER LOOP ──────────────────────────────
 if __name__ == "__main__":
     import asyncio
 
