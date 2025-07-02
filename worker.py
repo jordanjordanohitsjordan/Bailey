@@ -101,7 +101,7 @@ RECIPE_SYSTEM_PROMPT = (
     "You are a culinary vision expert. Given EVERY frame of a cooking reel and its "
     "Instagram caption, output a JSON object with:\n"
     "• INGREDIENTS – distinct, singular nouns, order of appearance\n"
-    "• RECIPE_STEPS – up to ~8 concise numbered instructions\n"
+    "• RECIPE_STEPS – a detailed recipe of how to make the meal end to end step by step in an emoji bullet point list\n"
     "Do **not** add any keys beyond the schema."
 )
 
