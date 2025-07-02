@@ -70,7 +70,7 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-DM_CHAR_LIMIT = 900
+BYTE_LIMIT = 950
 
 # ─────────────────── PROMPTS & SCHEMAS ────────────────────────
 MEAL_DETECTION_PROMPT = """
