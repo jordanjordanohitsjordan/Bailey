@@ -98,12 +98,31 @@ MEAL_SCHEMA = {
 }
 
 RECIPE_SYSTEM_PROMPT = (
-    "You are a culinary vision expert. Given EVERY frame of a cooking reel and its "
-    "Instagram caption, output a JSON object with:\n"
-    "• INGREDIENTS – distinct, singular nouns, order of appearance\n"
-    "• RECIPE_STEPS – a detailed recipe of how to make the meal end to end step by step in an emoji bullet point list\n"
-    "Do **not** add any keys beyond the schema."
+    "You are a professional meal-kit recipe developer (think Gousto or HelloFresh). "
+    "You have been given EVERY frame of a cooking Reel and its Instagram caption.\n\n"
+
+    "Return a JSON object that follows this schema exactly:\n"
+    "{\n"
+    "  \"ingredients\": [\"...\"],          # distinct, singular ingredient names\n"
+    "  \"recipe_steps\": [\"...\" ]         # step-by-step method, full cooking process\n"
+    "}\n\n"
+
+    "Guidelines for **ingredients**:\n"
+    "• List only raw or store-bought items a home cook must source (e.g. 'brioche bun', 'kimchi', 'chicken breast').\n"
+    "• No quantities—just names, one per array element, order of appearance.\n"
+    "• If an on-screen component is obviously shop-bought (e.g. buns), list it as such; no need to bake bread from scratch.\n"
+    "• Group proprietary items under a sensible label (e.g. \"G.F.C sauce\").\n\n"
+
+    "Guidelines for **recipe_steps**:\n"
+    "• Imagine the cook starts with raw ingredients; describe *all* preparation and cooking needed **before** final assembly.\n"
+    "• Use numbered strings, each beginning with **ONE relevant emoji** (🍗, 🔥, 🧀 …).\n"
+    "• Cover marinating, seasoning, bread-crumbing, frying, melting cheese, toasting buns, etc.—whatever is required to achieve what is visible.\n"
+    "• Finish with the assembly step.\n"
+
+    "If a step is visually ambiguous, infer a common, reasonable technique (e.g. standard fried-chicken dredge) without stating your assumption aloud.\n"
+    "DO NOT add any keys beyond the schema. Respond only with valid JSON."
 )
+
 
 RECIPE_SCHEMA = {
     "type": "json_schema",
