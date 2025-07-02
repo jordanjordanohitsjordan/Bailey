@@ -70,7 +70,7 @@ frames_table = Table(
     Column("frame_number", Integer),
 )
 
-DM_CHAR_LIMIT = 1900
+DM_CHAR_LIMIT = 900
 
 # ─────────────────── PROMPTS & SCHEMAS ────────────────────────
 MEAL_DETECTION_PROMPT = """
@@ -239,32 +239,28 @@ def format_recipe_text(data: dict) -> str:
 
 def send_recipe_dm(recipient_id: str, data: dict):
     """
-    Splits the recipe into multiple DMs **at step boundaries** so that
-    no numbered step is ever cut in half.
+    Split the recipe into multiple Instagram DMs.
+    • Never splits a numbered step.
+    • Each message <= BYTE_LIMIT UTF-8 bytes.
     """
-
-    # Build text blocks
     header = "Here’s your recipe! 👩‍🍳\n\nIngredients:\n"
     ingredients_block = "\n".join(f"• {item}" for item in data["ingredients"])
-    steps_lines = [
-        f"{i+1}. {step}" for i, step in enumerate(data["recipe_steps"])
-    ]
+    steps_lines = [f"{i+1}. {step}" for i, step in enumerate(data["recipe_steps"])]
 
-    # Start first chunk with header + ingredients
     current_chunk = f"{header}{ingredients_block}\n\nSteps:\n"
 
+    def _bytes(s: str) -> int:
+        return len(s.encode("utf-8"))
+
     for line in steps_lines:
-        # +1 for the newline we’ll add
-        prospective_len = len(current_chunk) + len(line) + 1
-        if prospective_len > DM_CHAR_LIMIT:
-            # Flush the chunk before adding the next step
+        prospective = current_chunk + line + "\n"
+        if _bytes(prospective) > BYTE_LIMIT:
             send_ig_message(recipient_id, current_chunk.rstrip())
-            time.sleep(0.3)  # small delay to keep ordering
+            time.sleep(0.4)                 # tiny pause keeps ordering
             current_chunk = line + "\n"
         else:
-            current_chunk += line + "\n"
+            current_chunk = prospective
 
-    # Send whatever is left (last chunk)
     if current_chunk.strip():
         send_ig_message(recipient_id, current_chunk.rstrip())
 
