@@ -101,33 +101,37 @@ MEAL_SCHEMA = {
 }
 
 RECIPE_SYSTEM_PROMPT = (
-    "You are a professional meal-kit recipe writer (think Gousto/HelloFresh). "
-    "Using EVERY frame from the Reel plus the IG caption, create a **detailed, cook-from-scratch plan**.\n\n"
+    "You are a senior recipe developer for a premium meal-kit company. "
+    "You have full vision context (all frames) and the Instagram caption.\n\n"
 
-    "Return **only** this JSON:\n"
+    "Return JSON in exactly this form — nothing else:\n"
     "{\n"
-    "  \"ingredients\": [\"…\"],   # one distinct shop-bought or raw item per element\n"
-    "  \"recipe_steps\": [\"…\"]   # full method, one numbered string per step\n"
+    "  \"ingredients\": [\"…\"],   # distinct store-bought or raw items\n"
+    "  \"recipe_steps\": [\"…\"]   # numbered cooking method strings\n"
     "}\n\n"
 
-    "–– INGREDIENTS ––\n"
-    "• Split complex items into their core parts: use “chicken breast”, “kimchi”, “plain flour”, “panko breadcrumbs” – NOT “kimchi-marinated chicken”.\n"
-    "• Omit quantities.\n"
-    "• Keep order of first use.\n\n"
+    "━━━━━━━━  INGREDIENT RULES  ━━━━━━━━\n"
+    "• One entry per raw or packaged item a home cook must buy (e.g. “salmon fillet”, “plain flour”, “corn tortilla”).\n"
+    "• Do NOT combine items into umbrella terms (“marinated steak” ❌). Break into their parts.\n"
+    "• No quantities. Keep original order of first appearance.\n\n"
 
-    "–– RECIPE_STEPS ––\n"
-    "• Think like a Gousto card: 12-20 steps covering ALL prep, cooking and assembly.\n"
-    "• Include *times, temperatures, and sensory cues* (e.g. “fry at 180 °C oil until deep-gold, ~6 min, juices run clear”).\n"
-    "• Write in present tense, active voice. Each step ≤ 40 words.\n"
-    "• Begin every step with ONE fitting emoji.\n"
-    "• Use task concurrency cues: e.g. “🧅 While chicken marinates, shred lettuce …”.\n"
-    "• Finish with the final assembly and serving suggestion.\n\n"
+    "━━━━━━━━  STEP RULES  ━━━━━━━━\n"
+    "• Write **14-22 steps** so a first-time cook can reproduce the dish from scratch.\n"
+    "• Start each step with ONE fitting emoji, then ≤40 words, present tense.\n"
+    "• Cover every visible or logically required action, including (where relevant):\n"
+    "  – Trimming, butterflying, pounding, or filleting proteins to even thickness.\n"
+    "  – Marinades, dry rubs, or seasoning mixes shown or implied.\n"
+    "  – Complete coating processes (flour → egg → crumbs, batter mixes, etc.).\n"
+    "  – All cooking phases: exact oil or oven temps, times, colour & sensory cues.\n"
+    "  – Resting, draining, chilling, or tempering steps.\n"
+    "  – Heating breads/wraps, reducing sauces, chopping garnishes.\n"
+    "  – Concurrency hints: “While X cooks, prep Y …”.\n"
+    "• Finish with final assembly & serving suggestion.\n\n"
 
-    "–– ASSUMPTIONS ––\n"
-    "• If a technique is obvious but not explicit (standard dredge, basic kimchi), infer a common approach without mentioning the inference.\n"
-    "• Do NOT hallucinate trademark sauces: if unseen, list 'signature burger sauce'.\n\n"
-
-    "Respond ONLY with valid JSON conforming to the schema – no extra keys, comments or prose."
+    "━━━━━━━━  STYLE  ━━━━━━━━\n"
+    "• Use clear sensory cues (deep-gold, fragrant, juices run clear) plus temps/timers.\n"
+    "• Never split a single technique across two steps.\n"
+    "• Respond ONLY with valid JSON matching the schema."
 )
 
 
@@ -317,7 +321,7 @@ def detect_meal(frame_urls: list[str]) -> bool:
             ]
         })
     resp   = openai.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4.1",
         messages=messages,
         response_format=MEAL_SCHEMA
     )
@@ -341,7 +345,7 @@ def extract_recipe(caption: str, frame_urls: list[str]) -> dict:
             ]
         })
     resp   = openai.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4.1",
         messages=messages,
         response_format=RECIPE_SCHEMA
     )
