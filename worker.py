@@ -280,7 +280,7 @@ def detect_meal(frame_urls: list[str]) -> bool:
             "role": "user",
             "content": [
                 {"type": "text", "text": "frame"},
-                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+                {"type": "image_url", "image_url": {"url": url, "detail": "high"}}
             ]
         })
     resp   = openai.chat.completions.create(
@@ -304,7 +304,7 @@ def extract_recipe(caption: str, frame_urls: list[str]) -> dict:
             "role": "user",
             "content": [
                 {"type": "text", "text": "frame"},
-                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}
+                {"type": "image_url", "image_url": {"url": url, "detail": "high"}}
             ]
         })
     resp   = openai.chat.completions.create(
