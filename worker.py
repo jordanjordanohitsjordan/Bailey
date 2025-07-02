@@ -98,29 +98,33 @@ MEAL_SCHEMA = {
 }
 
 RECIPE_SYSTEM_PROMPT = (
-    "You are a professional meal-kit recipe developer (think Gousto or HelloFresh). "
-    "You have been given EVERY frame of a cooking Reel and its Instagram caption.\n\n"
+    "You are a professional meal-kit recipe writer (think Gousto/HelloFresh). "
+    "Using EVERY frame from the Reel plus the IG caption, create a **detailed, cook-from-scratch plan**.\n\n"
 
-    "Return a JSON object that follows this schema exactly:\n"
+    "Return **only** this JSON:\n"
     "{\n"
-    "  \"ingredients\": [\"...\"],          # distinct, singular ingredient names\n"
-    "  \"recipe_steps\": [\"...\" ]         # step-by-step method, full cooking process\n"
+    "  \"ingredients\": [\"…\"],   # one distinct shop-bought or raw item per element\n"
+    "  \"recipe_steps\": [\"…\"]   # full method, one numbered string per step\n"
     "}\n\n"
 
-    "Guidelines for **ingredients**:\n"
-    "• List only raw or store-bought items a home cook must source (e.g. 'brioche bun', 'kimchi', 'chicken breast').\n"
-    "• No quantities—just names, one per array element, order of appearance.\n"
-    "• If an on-screen component is obviously shop-bought (e.g. buns), list it as such; no need to bake bread from scratch.\n"
-    "• Group proprietary items under a sensible label (e.g. \"G.F.C sauce\").\n\n"
+    "–– INGREDIENTS ––\n"
+    "• Split complex items into their core parts: use “chicken breast”, “kimchi”, “plain flour”, “panko breadcrumbs” – NOT “kimchi-marinated chicken”.\n"
+    "• Omit quantities.\n"
+    "• Keep order of first use.\n\n"
 
-    "Guidelines for **recipe_steps**:\n"
-    "• Imagine the cook starts with raw ingredients; describe *all* preparation and cooking needed **before** final assembly.\n"
-    "• Use numbered strings, each beginning with **ONE relevant emoji** (🍗, 🔥, 🧀 …).\n"
-    "• Cover marinating, seasoning, bread-crumbing, frying, melting cheese, toasting buns, etc.—whatever is required to achieve what is visible.\n"
-    "• Finish with the assembly step.\n"
+    "–– RECIPE_STEPS ––\n"
+    "• Think like a Gousto card: 12-20 steps covering ALL prep, cooking and assembly.\n"
+    "• Include *times, temperatures, and sensory cues* (e.g. “fry at 180 °C oil until deep-gold, ~6 min, juices run clear”).\n"
+    "• Write in present tense, active voice. Each step ≤ 40 words.\n"
+    "• Begin every step with ONE fitting emoji.\n"
+    "• Use task concurrency cues: e.g. “🧅 While chicken marinates, shred lettuce …”.\n"
+    "• Finish with the final assembly and serving suggestion.\n\n"
 
-    "If a step is visually ambiguous, infer a common, reasonable technique (e.g. standard fried-chicken dredge) without stating your assumption aloud.\n"
-    "DO NOT add any keys beyond the schema. Respond only with valid JSON."
+    "–– ASSUMPTIONS ––\n"
+    "• If a technique is obvious but not explicit (standard dredge, basic kimchi), infer a common approach without mentioning the inference.\n"
+    "• Do NOT hallucinate trademark sauces: if unseen, list 'signature burger sauce'.\n\n"
+
+    "Respond ONLY with valid JSON conforming to the schema – no extra keys, comments or prose."
 )
 
 
@@ -212,7 +216,7 @@ def generate_ack_text(is_meal: bool, caption: str, frame_urls: list[str]) -> str
     messages.append({"role": "user", "content": live_user})
 
     resp = openai.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4.1",
         messages=messages,
     )
     return resp.choices[0].message.content.strip()
