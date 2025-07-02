@@ -239,24 +239,33 @@ def format_recipe_text(data: dict) -> str:
 
 def send_recipe_dm(recipient_id: str, data: dict):
     """
-    Split the recipe into multiple Instagram DMs.
-    • Never splits a numbered step.
-    • Each message <= BYTE_LIMIT UTF-8 bytes.
+    Sends the recipe in IG DMs, ensuring every payload ≤ BYTE_LIMIT UTF-8 bytes
+    and never splitting a numbered step.
     """
     header = "Here’s your recipe! 👩‍🍳\n\nIngredients:\n"
     ingredients_block = "\n".join(f"• {item}" for item in data["ingredients"])
     steps_lines = [f"{i+1}. {step}" for i, step in enumerate(data["recipe_steps"])]
 
-    current_chunk = f"{header}{ingredients_block}\n\nSteps:\n"
-
     def _bytes(s: str) -> int:
         return len(s.encode("utf-8"))
 
+    # ---------- First chunk: header + ingredients ----------
+    first_chunk = f"{header}{ingredients_block}\n\nSteps:\n"
+    if _bytes(first_chunk) > BYTE_LIMIT:
+        # Very long ingredient list — send it alone
+        send_ig_message(recipient_id, first_chunk.rstrip())
+        time.sleep(0.4)
+        current_chunk = ""          # start fresh for steps
+    else:
+        current_chunk = first_chunk
+
+    # ---------- Add steps, splitting at boundaries ----------
     for line in steps_lines:
         prospective = current_chunk + line + "\n"
         if _bytes(prospective) > BYTE_LIMIT:
+            # flush current chunk
             send_ig_message(recipient_id, current_chunk.rstrip())
-            time.sleep(0.4)                 # tiny pause keeps ordering
+            time.sleep(0.4)
             current_chunk = line + "\n"
         else:
             current_chunk = prospective
